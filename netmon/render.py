@@ -13,9 +13,10 @@ from textual.strip import Strip
 
 from .classify import INTERNET, INTRANET
 from .packets import TCP, UDP
+from .focus import LEVEL_ALL, LEVEL_SERVER, client_key, group_key, hint_labels
 from .geo import EASTERN, EUROPE, GERMANY, LOCAL, REGION_LABELS, REST, UNKNOWN, WESTERN
 from .treemap import Rect, fit_layout
-from .views import ClientView, GroupView, weight
+from .views import ClientView, GroupView, service_name, weight
 
 COLOR_RATE = "rate"
 COLOR_PROTO = "proto"
@@ -112,6 +113,9 @@ class RenderOptions:
     color: str = COLOR_GEO
     scale: str = SCALE_SQRT
     panes: tuple[str, ...] = (INTRANET, INTERNET)
+    level: int = LEVEL_ALL
+    selected: tuple | None = None  # focus.group_key / client_key / ("p", scope)
+    hints: bool = False  # overlay A..Z labels on selectable boxes
 
 
 @dataclass
@@ -120,6 +124,16 @@ class Hit:
     group: GroupView | None
     client: ClientView | None = None
     others: int = 0
+    pane: str | None = None  # set for a pane's title bar
+
+    @property
+    def key(self) -> tuple | None:
+        """Selection key, or None for boxes that cannot be zoomed into ("+N more")."""
+        if self.pane is not None:
+            return ("p", self.pane)
+        if self.others or self.group is None:
+            return None
+        return client_key(self.client) if self.client is not None else group_key(self.group)
 
 
 class Canvas:
@@ -235,12 +249,54 @@ class Painter:
         panes = self.opts.panes
         if not panes or w < 4 or h < 3:
             return canvas
-        rects = self._pane_rects(Rect(0, 0, w, h), len(panes))
-        for scope, r in zip(panes, rects):
-            self.draw_pane(canvas, r, scope)
+        if self.opts.level >= LEVEL_SERVER:
+            full = Rect(0, 0, w, h)
+            if self.groups:
+                self.draw_group(canvas, full, self.groups[0], zoomed=True)
+            else:
+                msg = "no traffic for this server any more (idle pairs expire) — Esc to go back"
+                canvas.text(max((w - len(msg)) // 2, 0), h // 2, msg, _style(fg=(150, 150, 160), bg=BG), w)
+            last = full
+        else:
+            rects = self._pane_rects(Rect(0, 0, w, h), len(panes))
+            for scope, r in zip(panes, rects):
+                self.draw_pane(canvas, r, scope)
+            last = rects[-1]
         if self.opts.color == COLOR_GEO:
-            self.draw_legend(canvas, rects[-1])
+            self.draw_legend(canvas, last)
+        self.draw_selection(canvas)
+        if self.opts.hints:
+            self.draw_hints(canvas)
         return canvas
+
+    # -- selection and hints -------------------------------------------------
+    def selectables(self) -> list[Hit]:
+        """Boxes that can be selected/zoomed at the current level, in drawing order."""
+        if self.opts.level >= LEVEL_SERVER:
+            return [h for h in self.hits if h.client is not None]
+        items = [h for h in self.hits if h.key is not None and h.client is None]
+        return sorted(items, key=lambda h: h.pane is None)  # pane titles get the first letters
+
+    def hint_map(self) -> dict[str, Hit]:
+        items = self.selectables()
+        return dict(zip(hint_labels(len(items)), items))
+
+    def is_selected(self, key: tuple) -> bool:
+        return self.opts.selected == key
+
+    def draw_selection(self, canvas: Canvas) -> None:
+        """Pane titles get a marker; server and client boxes draw their own highlight."""
+        sel = self.opts.selected
+        if sel and sel[0] == "p":
+            hit = next((h for h in self.hits if h.pane == sel[1]), None)
+            if hit is not None:
+                canvas.text(hit.rect.x, hit.rect.y, "▶", _style(fg=(255, 255, 255), bg=BG, bold=True))
+
+    def draw_hints(self, canvas: Canvas) -> None:
+        # labels sit on the box corner / border so they never hide the title
+        style = _style(fg=(0, 0, 0), bg=(255, 220, 60), bold=True)
+        for label, h in self.hint_map().items():
+            canvas.text(h.rect.x, h.rect.y, label, style)
 
     @staticmethod
     def _pane_rects(r: Rect, n: int) -> list[Rect]:
@@ -284,6 +340,8 @@ class Painter:
             f"↑{fmt_rate(up)} ↓{fmt_rate(down)} · Σ{fmt_bytes(total)} "
         )
         canvas.text(r.x + 2, r.y, title, _style(fg=color, bg=BG, bold=True), r.w - 4)
+        if self.opts.level == LEVEL_ALL:
+            self.hits.append(Hit(Rect(r.x + 1, r.y, min(len(title) + 2, r.w - 2), 1), None, pane=scope))
         inner = r.inset(1)
         if inner.w <= 0 or inner.h <= 0:
             return
@@ -312,7 +370,7 @@ class Painter:
         canvas.text(r.x, r.y + (r.h // 2 if parent is None else 0), label, style, r.w)
         self.hits.append(Hit(r, parent, None, n))
 
-    def draw_group(self, canvas: Canvas, r: Rect, g: GroupView) -> None:
+    def draw_group(self, canvas: Canvas, r: Rect, g: GroupView, zoomed: bool = False) -> None:
         color = self.group_color(g)
         self.hits.append(Hit(r, g))
         if r.w < 4 or r.h < 3:
@@ -320,8 +378,11 @@ class Painter:
             canvas.fill(r, style)
             canvas.text(r.x, r.y, g.label, style, r.w)
             return
-        border = _style(fg=color, bg=BG)
-        canvas.box(r, border)
+        selected = not zoomed and self.is_selected(group_key(g))
+        if selected:
+            color = (255, 255, 255)
+        border = _style(fg=color, bg=BG, bold=selected)
+        canvas.box(r, border, HEAVY if selected else ROUND)
         geo = f"{g.cc} " if g.server_is_remote and g.cc else ""
         title = f" {geo}{g.label} {g.services} "
         rate = f" {fmt_rate(g.rate)} " if self.opts.metric == "rate" else f" {fmt_bytes(g.total)} "
@@ -333,8 +394,9 @@ class Painter:
 
         inner = r.inset(1)
         weights = [self.size_of(c) for c in g.clients]
+        min_w, min_h = (CLIENT_MIN_W + 8, CLIENT_MIN_H + 3) if zoomed else (CLIENT_MIN_W, CLIENT_MIN_H)
         kept, dropped, rects, others = fit_layout(
-            weights, inner, CLIENT_MIN_W, CLIENT_MIN_H, self._merge([weight(c, self.opts.metric) for c in g.clients])
+            weights, inner, min_w, min_h, self._merge([weight(c, self.opts.metric) for c in g.clients])
         )
         if not kept and others is None:
             canvas.text(inner.x, inner.y, f"{len(g.clients)} idle", _style(fg=(110, 110, 120), bg=BG), inner.w)
@@ -342,24 +404,31 @@ class Painter:
         hidden = sum(1 for i in dropped if weights[i] > 0)
         for i, cr in zip(kept, rects):
             if cr.area:
-                self.draw_client(canvas, cr, g, g.clients[i], hidden if others is None else 0)
+                self.draw_client(canvas, cr, g, g.clients[i], hidden if others is None else 0, zoomed)
         if others is not None and others.area:
             self.draw_others(canvas, others, [], parent=g, count=hidden)
 
-    def draw_client(self, canvas: Canvas, r: Rect, g: GroupView, c: ClientView, hidden: int = 0) -> None:
+    def draw_client(
+        self, canvas: Canvas, r: Rect, g: GroupView, c: ClientView, hidden: int = 0, zoomed: bool = False
+    ) -> None:
         bg = self.client_color(g, c)
         fg = _fg_for(bg)
         style = _style(fg=fg, bg=bg)
         canvas.fill(r, style)
         self.hits.append(Hit(r, g, c))
-        # a darker right/bottom edge separates neighbouring boxes of similar colour
-        edge = _style(fg=_shade(bg, 0.55), bg=bg)
-        if r.w >= 6:
-            for y in range(r.y, r.y + r.h):
-                canvas.text(r.x + r.w - 1, y, "▕", edge)
-        if r.h >= 3:
-            canvas.text(r.x, r.y + r.h - 1, "▁" * (r.w - (1 if r.w >= 6 else 0)), edge)
-        tw = r.w - (1 if r.w >= 6 else 0)
+        framed = zoomed and self.is_selected(client_key(c)) and r.w >= 6 and r.h >= 3
+        if framed:
+            canvas.box(r, _style(fg=(255, 255, 255), bg=bg, bold=True), HEAVY)
+            r = r.inset(1)  # text goes inside the highlight frame
+        else:
+            # a darker right/bottom edge separates neighbouring boxes of similar colour
+            edge = _style(fg=_shade(bg, 0.55), bg=bg)
+            if r.w >= 6:
+                for y in range(r.y, r.y + r.h):
+                    canvas.text(r.x + r.w - 1, y, "▕", edge)
+            if r.h >= 3:
+                canvas.text(r.x, r.y + r.h - 1, "▁" * (r.w - (1 if r.w >= 6 else 0)), edge)
+        tw = r.w - (1 if r.w >= 6 and not framed else 0)
         inbound = c.remote == c.ip
         lines = [c.label + (f" {c.cc}" if inbound and c.cc else "")]
         if c.name:
@@ -368,7 +437,13 @@ class Painter:
         lines.append(f"Σ{fmt_bytes(c.total)} · {c.conns} conn")
         if hidden:
             lines.insert(1, f"+{hidden} more clients")
-        rows = r.h - (1 if r.h >= 3 else 0)
+        if zoomed:
+            if len(g.ports) > 1:
+                lines.append("→ " + ", ".join(service_name(p, pr) for p, pr in sorted(
+                    c.services, key=lambda s: (s[0] or -1, s[1]))))
+            if c.ports:
+                lines.append("ports " + " ".join(str(p) for p in sorted(c.ports)))
+        rows = r.h - (1 if r.h >= 3 and not framed else 0)
         if rows < len(lines) and c.name:
             lines.remove(c.ip)
         for i, line in enumerate(lines[: max(rows, 1)]):
@@ -391,6 +466,8 @@ def _geo_text(cc: str | None, region: str) -> str:
 def describe(hit: Hit | None, metric: str) -> str:
     if hit is None:
         return ""
+    if hit.pane is not None:
+        return f"{hit.pane} — Enter or double-click to zoom in"
     if hit.group is None:
         return f"{hit.others} smaller servers not shown — filter, use `v` for one pane, or `l` for log scale"
     g = hit.group

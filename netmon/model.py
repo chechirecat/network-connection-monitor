@@ -59,6 +59,7 @@ class PairView:
     last_seen: float
     remote: str | None = None
     remote_cc: str | None = None  # country of the remote endpoint
+    first_seen: float = 0.0
 
     @property
     def rate(self) -> float:
@@ -180,6 +181,7 @@ class TrafficModel:
                         last_seen=pr.last_seen,
                         remote=pr.remote,
                         remote_cc=self.geo(pr.remote) if pr.remote else None,
+                        first_seen=pr.first_seen,
                     )
                 )
             for key in dead:

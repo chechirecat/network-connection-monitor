@@ -44,6 +44,8 @@ class ClientView:
     conns: int = 0
     cc: str | None = None  # country of the remote end of this client's traffic
     remote: str | None = None
+    ports: set[int] = field(default_factory=set)  # client-side ports (one per connection)
+    services: set[tuple[int | None, int]] = field(default_factory=set)  # server (port, proto)
 
     @property
     def region(self) -> str:
@@ -69,6 +71,7 @@ class GroupView:
     name: str | None = None
     cc: str | None = None
     server_is_remote: bool = False
+    service: tuple[int | None, int] | None = None  # (port, proto) when grouped by service
     ports: set[tuple[int | None, int]] = field(default_factory=set)  # (port, proto)
     clients: list[ClientView] = field(default_factory=list)
 
@@ -126,7 +129,12 @@ def build_groups(
         gkey = (p.scope, p.server) if mode == GROUP_HOST else (p.scope, p.server, p.port, p.proto)
         g = groups.get(gkey)
         if g is None:
-            g = groups[gkey] = GroupView(scope=p.scope, server=p.server, name=names(p.server))
+            g = groups[gkey] = GroupView(
+                scope=p.scope,
+                server=p.server,
+                name=names(p.server),
+                service=None if mode == GROUP_HOST else (p.port, p.proto),
+            )
         if p.remote == p.server:
             g.server_is_remote, g.cc = True, p.remote_cc
         g.ports.add((p.port, p.proto))
@@ -142,6 +150,8 @@ def build_groups(
         c.up += p.up
         c.down += p.down
         c.conns += p.conns
+        c.ports |= p.client_ports
+        c.services.add((p.port, p.proto))
     return list(groups.values())
 
 

@@ -49,17 +49,35 @@ sudo tcpdump -i any -U -w - | .venv/bin/netmon --pcap -       # UI unprivileged
 
 Options: `--no-dns`, `--geoip FILE`, `--update-geoip`, `--no-geoip-update`, `--local-net CIDR` (repeatable), `--expire SEC`, `--interval SEC`.
 
+## Zooming
+
+The view is a zoom stack, shown as a breadcrumb at the top: **All › Internet › DE 46.4.0.10 › 192.168.1.10**.
+
+| Level | Shows |
+|---|---|
+| All | intranet and internet side by side |
+| Pane | one of them, full screen |
+| Server | one server; each client box also lists its connection ports |
+| Client | details for one client ↔ server pair: names, location, rates, totals, per-service connections and client ports |
+
+- `Space` puts letters on every box at the current level (pane titles get the first ones); type a letter (two once there are more than 26) to zoom in.
+- Arrow keys move the white highlight, `Enter` zooms into it; double-click zooms with the mouse.
+- `Esc` / `Backspace` zoom out one level, keeping the box you came from highlighted.
+- In the table (`t`), `Enter` on a row zooms into that server or client.
+- Filter, sort, size and color apply at every level.
+
 ## Keys
 
 | Key | Action |
 |---|---|
-| `/` | filter (Enter apply, Esc close; Esc again clears) |
+| `/` | filter (Enter apply, Esc close; Esc at the top level clears it) |
 | `s` / `r` | cycle sort (size, name, clients, port) / reverse |
 | `m` | size by current rate ↔ total bytes |
 | `l` | size scale: sqrt → log → linear |
 | `c` | color by distance → rate heat → protocol → service |
 | `g` | one box per server host ↔ per host+port+protocol |
-| `v` | panes: both → intranet → internet |
+| `v` | zoom to: all → intranet → internet |
+| `Space` / arrows + `Enter` / `Esc` | zoom with letters / select and zoom / back (see above) |
 | `t` | table view |
 | `p` / `z` / `q` | pause / reset totals / quit |
 
