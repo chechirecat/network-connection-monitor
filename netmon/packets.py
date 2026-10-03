@@ -34,6 +34,14 @@ def proto_name(proto: int) -> str:
     return PROTO_NAMES.get(proto, str(proto))
 
 
+TCP_FIN = 0x01
+TCP_SYN = 0x02
+TCP_RST = 0x04
+TCP_PSH = 0x08
+TCP_ACK = 0x10
+TCP_URG = 0x20
+
+
 @dataclass(slots=True, frozen=True)
 class Packet:
     src: str
@@ -44,21 +52,42 @@ class Packet:
     length: int
     syn: bool = False
     ack: bool = False
+    tcp_flags: int = 0
+    seq: int | None = None
+    ack_no: int | None = None
+    payload_len: int = 0  # bytes after the TCP/UDP header
+    payload: bytes = b""  # first bytes of the payload, only when capture asked for them
+
+    @property
+    def fin(self) -> bool:
+        return bool(self.tcp_flags & TCP_FIN)
+
+    @property
+    def rst(self) -> bool:
+        return bool(self.tcp_flags & TCP_RST)
 
 
-def parse_ip(data: bytes | memoryview) -> Packet | None:
-    """Parse a packet starting at the IP header (version is taken from the first nibble)."""
+def flags_text(flags: int) -> str:
+    """tcpdump-style flag summary, e.g. ``S.`` for SYN+ACK."""
+    out = "".join(c for bit, c in ((TCP_SYN, "S"), (TCP_FIN, "F"), (TCP_RST, "R"), (TCP_PSH, "P"), (TCP_URG, "U"))
+                  if flags & bit)
+    return out + ("." if flags & TCP_ACK else "")
+
+
+def parse_ip(data: bytes | memoryview, payload: int = 0) -> Packet | None:
+    """Parse a packet starting at the IP header (version is taken from the first nibble).
+    ``payload`` > 0 keeps up to that many bytes of the transport payload."""
     if len(data) < 1:
         return None
     version = data[0] >> 4
     if version == 4:
-        return _parse_ipv4(data)
+        return _parse_ipv4(data, payload)
     if version == 6:
-        return _parse_ipv6(data)
+        return _parse_ipv6(data, payload)
     return None
 
 
-def _parse_ipv4(data: bytes | memoryview) -> Packet | None:
+def _parse_ipv4(data: bytes | memoryview, keep: int) -> Packet | None:
     if len(data) < 20:
         return None
     ihl = (data[0] & 0x0F) * 4
@@ -70,10 +99,10 @@ def _parse_ipv4(data: bytes | memoryview) -> Packet | None:
     dst = socket.inet_ntop(socket.AF_INET, bytes(data[16:20]))
     length = total_len or len(data)  # total_len is 0 for some offloaded (TSO) packets
     first_fragment = (frag & 0x1FFF) == 0
-    return _parse_l4(data, ihl if first_fragment else None, proto, src, dst, length)
+    return _parse_l4(data, ihl if first_fragment else None, proto, src, dst, length, keep)
 
 
-def _parse_ipv6(data: bytes | memoryview) -> Packet | None:
+def _parse_ipv6(data: bytes | memoryview, keep: int) -> Packet | None:
     if len(data) < 40:
         return None
     (payload_len,) = struct.unpack_from("!H", data, 4)
@@ -93,22 +122,34 @@ def _parse_ipv6(data: bytes | memoryview) -> Packet | None:
         else:
             nxt, ext_len = data[off], (data[off + 1] + 1) * 8
             off += ext_len
-    return _parse_l4(data, off, nxt, src, dst, length)
+    return _parse_l4(data, off, nxt, src, dst, length, keep)
 
 
-def _parse_l4(data, off: int | None, proto: int, src: str, dst: str, length: int) -> Packet:
-    sport = dport = None
-    syn = ack = False
+def _parse_l4(data, off: int | None, proto: int, src: str, dst: str, length: int, keep: int = 0) -> Packet:
+    sport = dport = seq = ack_no = None
+    flags = 0
+    payload_off = None
     if off is not None and proto in (TCP, UDP) and len(data) >= off + 4:
         sport, dport = struct.unpack_from("!HH", data, off)
         if proto == TCP and len(data) >= off + 14:
+            seq, ack_no = struct.unpack_from("!II", data, off + 4)
             flags = data[off + 13]
-            syn = bool(flags & 0x02)
-            ack = bool(flags & 0x10)
-    return Packet(src, dst, proto, sport, dport, length, syn, ack)
+            payload_off = off + (data[off + 12] >> 4) * 4
+        elif proto == UDP:
+            payload_off = off + 8
+    elif off is not None:
+        payload_off = off  # ICMP and others: everything after the IP header
+    # payload length from the IP lengths, so it is right even for truncated captures
+    payload_len = max(length - payload_off, 0) if payload_off is not None else 0
+    payload = bytes(data[payload_off : payload_off + min(keep, payload_len)]) if keep and payload_off is not None else b""
+    return Packet(
+        src, dst, proto, sport, dport, length,
+        syn=bool(flags & TCP_SYN), ack=bool(flags & TCP_ACK), tcp_flags=flags,
+        seq=seq, ack_no=ack_no, payload_len=payload_len, payload=payload,
+    )
 
 
-def parse_ethernet(frame: bytes | memoryview) -> Packet | None:
+def parse_ethernet(frame: bytes | memoryview, payload: int = 0) -> Packet | None:
     if len(frame) < 14:
         return None
     off = 12
@@ -118,25 +159,25 @@ def parse_ethernet(frame: bytes | memoryview) -> Packet | None:
         (ethertype,) = struct.unpack_from("!H", frame, off)
     if ethertype not in (ETH_P_IP, ETH_P_IPV6):
         return None
-    return parse_ip(frame[off + 2 :])
+    return parse_ip(frame[off + 2 :], payload)
 
 
-def parse_frame(frame: bytes | memoryview, linktype: int) -> Packet | None:
+def parse_frame(frame: bytes | memoryview, linktype: int, payload: int = 0) -> Packet | None:
     """Parse a captured frame of the given pcap link type."""
     if linktype == LINKTYPE_ETHERNET:
-        return parse_ethernet(frame)
+        return parse_ethernet(frame, payload)
     if linktype in (LINKTYPE_RAW, LINKTYPE_IPV4, LINKTYPE_IPV6):
-        return parse_ip(frame)
+        return parse_ip(frame, payload)
     if linktype == LINKTYPE_LINUX_SLL:
         if len(frame) < 16:
             return None
         (ethertype,) = struct.unpack_from("!H", frame, 14)
-        return parse_ip(frame[16:]) if ethertype in (ETH_P_IP, ETH_P_IPV6) else None
+        return parse_ip(frame[16:], payload) if ethertype in (ETH_P_IP, ETH_P_IPV6) else None
     if linktype == LINKTYPE_LINUX_SLL2:
         if len(frame) < 20:
             return None
         (ethertype,) = struct.unpack_from("!H", frame, 0)
-        return parse_ip(frame[20:]) if ethertype in (ETH_P_IP, ETH_P_IPV6) else None
+        return parse_ip(frame[20:], payload) if ethertype in (ETH_P_IP, ETH_P_IPV6) else None
     if linktype == LINKTYPE_NULL:
-        return parse_ip(frame[4:])
+        return parse_ip(frame[4:], payload)
     return None

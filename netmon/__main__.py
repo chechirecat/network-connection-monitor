@@ -27,6 +27,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     src.add_argument("--demo", action="store_true", help="show synthetic traffic (no root needed)")
     ap.add_argument("--fast", action="store_true", help="with --pcap FILE: load as fast as possible instead of replaying")
     ap.add_argument("--no-dns", action="store_true", help="disable reverse DNS lookups")
+    ap.add_argument("--payload", action="store_true",
+                    help="start with payload capture on: the dump shows the first 64 bytes of each packet (key x)")
     ap.add_argument("--geoip", metavar="FILE",
                     help="country range CSV (start,end,CC; .gz ok). Default: $NETMON_GEOIP or ~/.cache/netmon/")
     ap.add_argument("--update-geoip", action="store_true",
@@ -82,6 +84,10 @@ def main(argv: list[str] | None = None) -> int:
 
     from .app import NetMonApp  # imported late so --help stays fast
 
+    if args.payload:
+        from .app import PAYLOAD_BYTES
+
+        source.payload_bytes = PAYLOAD_BYTES
     geodb = load_geo(args)  # starts before the UI so a stale file can be refreshed meanwhile
     model = TrafficModel(Classifier(args.local_net), geo=geodb.lookup, expire=args.expire)
     resolver = Resolver(enabled=not args.no_dns and not args.demo)

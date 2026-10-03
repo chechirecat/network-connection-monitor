@@ -11,7 +11,7 @@ import threading
 import time
 from typing import BinaryIO, Callable
 
-from .packets import TCP, UDP, Packet, parse_frame, parse_ip
+from .packets import TCP, TCP_ACK, TCP_FIN, TCP_PSH, TCP_SYN, UDP, Packet, parse_frame, parse_ip
 
 Sink = Callable[[Packet], None]
 
@@ -27,6 +27,7 @@ class Source:
     description = "?"
 
     def __init__(self) -> None:
+        self.payload_bytes = 0  # >0: keep that many payload bytes per packet (dump view, opt-in)
         self.finished = False
         self.error: str | None = None
         self._stop = threading.Event()
@@ -84,7 +85,7 @@ class LiveSource(Source):
             # Loopback traffic shows up twice (outgoing + incoming); keep one copy.
             if addr[2] == PACKET_OUTGOING and addr[0] == "lo":
                 continue
-            pkt = parse_ip(view[:n])
+            pkt = parse_ip(view[:n], self.payload_bytes)
             if pkt is not None:
                 sink(pkt)
         self.sock.close()
@@ -140,7 +141,7 @@ class PcapSource(Source):
                 delay = (ts - first_ts) - (time.monotonic() - start)
                 if delay > 0 and self._stop.wait(delay):
                     break
-            pkt = parse_frame(frame, self.linktype)
+            pkt = parse_frame(frame, self.linktype, self.payload_bytes)
             if pkt is not None:
                 sink(pkt)
 
@@ -219,14 +220,44 @@ class DemoSource(Source):
                     f[7] -= 1
                     if f[7] <= 0:
                         flows.remove(f)
+                        self._close(sink, f)
                         continue
                 total = f[5] * f[6] * dt
                 down = total * rng.uniform(0.6, 0.95)
                 client, cport, server, sport, proto = f[:5]
-                sink(Packet(client, server, proto, cport, sport, int(total - down) + 40, ack=True))
-                sink(Packet(server, client, proto, sport, cport, int(down) + 40, ack=True))
+                sink(self._packet(rng, client, server, proto, cport, sport, int(total - down) + 40, True))
+                sink(self._packet(rng, server, client, proto, sport, cport, int(down) + 40, False))
+
+    def _packet(self, rng, src, dst, proto, sport, dport, length, up) -> Packet:
+        """A synthetic packet; payload looks like the protocol (plain HTTP/DNS, TLS records otherwise)."""
+        payload_len = max(length - 40, 0)
+        payload = b""
+        if self.payload_bytes:
+            port = dport if up else sport
+            if port == 80:
+                payload = (b"GET /ubuntu/dists/noble/InRelease HTTP/1.1\r\nHost: archive.ubuntu.com\r\n"
+                           if up else b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n")
+            elif port == 53:
+                payload = bytes([rng.randrange(256), rng.randrange(256)]) + b"\x01\x00\x00\x01" + b"\x07example\x03com\x00"
+            else:
+                payload = b"\x17\x03\x03" + rng.randbytes(61)  # looks like TLS application data
+            payload = payload[: min(self.payload_bytes, payload_len)]
+        flags = TCP_ACK | TCP_PSH if proto == TCP else 0
+        return Packet(src, dst, proto, sport, dport, length, ack=proto == TCP, tcp_flags=flags,
+                      seq=rng.getrandbits(32) if proto == TCP else None, payload_len=payload_len, payload=payload)
+
+    @staticmethod
+    def _close(sink: Sink, f) -> None:
+        client, cport, server, sport, proto = f[:5]
+        if proto == TCP:
+            for src, dst, sp, dp in ((client, server, cport, sport), (server, client, sport, cport)):
+                sink(Packet(src, dst, proto, sp, dp, 52, ack=True, tcp_flags=TCP_FIN | TCP_ACK))
 
     @staticmethod
     def _open(sink: Sink, f) -> None:
         client, cport, server, sport, proto = f[:5]
-        sink(Packet(client, server, proto, cport, sport, 60, syn=proto == TCP))
+        if proto == TCP:
+            sink(Packet(client, server, proto, cport, sport, 60, syn=True, tcp_flags=TCP_SYN))
+            sink(Packet(server, client, proto, sport, cport, 60, syn=True, ack=True, tcp_flags=TCP_SYN | TCP_ACK))
+        else:
+            sink(Packet(client, server, proto, cport, sport, 60))

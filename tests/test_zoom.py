@@ -111,3 +111,30 @@ async def test_double_click_and_table_drilldown():
         await pilot.press("down", "enter")  # its first client
         await pilot.pause()
         assert app.focus_path.level == LEVEL_CLIENT
+
+
+async def test_connections_and_dump_views():
+    app = await _app()
+    async with app.run_test(size=(160, 45)) as pilot:
+        await asyncio.sleep(1.0)
+        await pilot.press("2")
+        await pilot.pause()
+        conns = app.query_one("#conns")
+        assert app.view == "conns" and conns.display and conns.row_count > 10
+
+        await pilot.press("enter")  # zoom into the busiest connection's pair
+        await pilot.pause()
+        assert app.view == "map" and app.focus_path.level == LEVEL_CLIENT
+        assert app.model.watch is not None  # zoomed in: packets are being recorded
+
+        await pilot.press("x", "3")  # payload on, dump view
+        await asyncio.sleep(0.6)
+        await pilot.pause()
+        log = app.query_one("#dump")
+        assert app.view == "dump" and log.display and len(log.lines) > 0
+        assert any("0000" in line.text for line in log.lines)  # hex dump rows
+
+        await pilot.press("x", "1", "escape", "escape", "escape")
+        await pilot.pause()
+        assert app.source.payload_bytes == 0 and app.focus_path.level == LEVEL_ALL
+        assert app.model.watch is None  # back at the top: recording stopped

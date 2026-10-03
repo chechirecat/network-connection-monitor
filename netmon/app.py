@@ -12,13 +12,14 @@ from textual.containers import Vertical
 from textual.css.query import NoMatches
 from textual.strip import Strip
 from textual.widget import Widget
-from textual.widgets import DataTable, Footer, Input, Static
+from textual.widgets import DataTable, Footer, Input, RichLog, Static
 
 from .classify import INTERNET, INTRANET
-from .detail import detail_markup
+from .detail import _ago, detail_markup, dump_text
 from .focus import LEVEL_ALL, LEVEL_CLIENT, LEVEL_SERVER, Focus, nearest
 from .filters import FilterError, parse_filter
 from .model import PairView, TrafficModel
+from .packets import proto_name
 from .geo import MAX_AGE_DAYS, REGION_LABELS, GeoDB
 from .render import (
     COLOR_GEO,
@@ -49,6 +50,7 @@ from .views import (
 
 COLOR_MODES = (COLOR_GEO, COLOR_RATE, COLOR_PROTO, COLOR_SERVICE)
 SCALES = (SCALE_SQRT, SCALE_LOG, SCALE_LINEAR)
+PAYLOAD_BYTES = 64
 PANE_CYCLE = (None, INTRANET, INTERNET)  # `v`: all → intranet → internet
 ARROWS = {"left": "left", "right": "right", "up": "up", "down": "down"}
 
@@ -130,6 +132,8 @@ class NetMonApp(App):
     TreemapView { height: 1fr; }
     #table { height: 1fr; display: none; }
     #detail { height: 1fr; display: none; }
+    #conns { height: 1fr; display: none; }
+    #dump { height: 1fr; display: none; background: rgb(18,18,24); }
     #crumbs { height: 1; background: rgb(40,40,55); padding: 0 1; }
     #filter { dock: bottom; display: none; }
     #hover { height: 1; color: $text-muted; background: rgb(30,30,40); padding: 0 1; }
@@ -148,7 +152,11 @@ class NetMonApp(App):
         Binding("space", "toggle_hints", "Letters"),
         Binding("enter", "zoom_in", "Zoom", show=False),
         Binding("backspace", "zoom_out", "Back"),
+        Binding("1", "view('map')", "Map"),
+        Binding("2", "view('conns')", "Conns"),
+        Binding("3", "view('dump')", "Dump"),
         Binding("t", "toggle_table", "Table"),
+        Binding("x", "toggle_payload", "Payload"),
         Binding("p", "pause", "Pause"),
         Binding("z", "reset", "Reset Σ"),
         Binding("escape", "escape", "Back", show=False),
@@ -178,6 +186,9 @@ class NetMonApp(App):
         self.hints = False
         self._hint_buffer = ""
         self._table_targets: list[Focus] = []
+        self._conn_targets: list[Focus] = []
+        self.view = "map"  # map | table | conns | dump
+        self._dump_seq = 0
         self.filter_text = ""
         self.filter_pred = None
         self.filter_error = ""
@@ -187,6 +198,8 @@ class NetMonApp(App):
             yield Static(id="crumbs")
             yield TreemapView()
             yield DataTable(id="table", zebra_stripes=True, cursor_type="row")
+            yield DataTable(id="conns", zebra_stripes=True, cursor_type="row")
+            yield RichLog(id="dump", max_lines=20000, wrap=False)
             yield Static(id="detail")
             yield Static(id="hover")
             yield Static(id="status")
@@ -195,8 +208,13 @@ class NetMonApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        table = self.query_one(DataTable)
+        table = self.query_one("#table", DataTable)
         table.add_columns("Scope", "Server", "Geo", "Services", "Clients", "Conns", "↑ /s", "↓ /s", "Σ total")
+        self.query_one("#conns", DataTable).add_columns(
+            "Proto", "Client", "Port", "", "Server", "Port", "Service", "State",
+            "↑ /s", "↓ /s", "Σ ↑", "Σ ↓", "Pkts", "Age", "Idle",
+        )
+        self.update_watch()
         self.source.start(self.model.add)
         self.set_interval(self.interval, self.tick)
         self.tick()
@@ -239,21 +257,75 @@ class NetMonApp(App):
         )
         self.query_one(TreemapView).show(groups, opts)
         self.update_panels()
-        if self.query_one(DataTable).display:
+        if self.view == "table":
             self.fill_table(groups)
-        if focus.level == LEVEL_CLIENT:
-            self.query_one("#detail", Static).update(detail_markup(pairs, names, time.monotonic()))
+        elif self.view == "conns":
+            self.fill_conns({(p.client, p.server, p.port, p.proto) for p in pairs})
+        elif self.view == "dump":
+            self.append_dump({(p.client, p.server, p.port, p.proto) for p in pairs})
+        elif focus.level == LEVEL_CLIENT:
+            detail = self.query_one("#detail", Static)
+            history = self.model.history(focus.matches)
+            width = detail.size.width or self.size.width
+            detail.update(detail_markup(pairs, names, time.monotonic(), history, width))
         self.update_crumbs(groups)
         self.update_status(len(pairs))
 
     def update_panels(self) -> None:
-        """Show exactly one of map / table / detail."""
-        table = self.query_one(DataTable)
-        detail = self.query_one("#detail", Static)
-        tree = self.query_one(TreemapView)
-        detail_mode = self.focus_path.level == LEVEL_CLIENT and not table.display
-        detail.display = detail_mode
-        tree.display = not table.display and not detail_mode
+        """Show exactly one of map (treemap, or detail page at client level) / table / conns / dump."""
+        detail_mode = self.view == "map" and self.focus_path.level == LEVEL_CLIENT
+        self.query_one("#table", DataTable).display = self.view == "table"
+        self.query_one("#conns", DataTable).display = self.view == "conns"
+        self.query_one("#dump", RichLog).display = self.view == "dump"
+        self.query_one("#detail", Static).display = detail_mode
+        self.query_one(TreemapView).display = self.view == "map" and not detail_mode
+
+    def update_watch(self) -> None:
+        """Record packets for the dump while zoomed into a server or client, or while the dump is open."""
+        watching = self.view == "dump" or self.focus_path.level >= LEVEL_SERVER
+        self.model.set_watch(self.focus_path.matches if watching else None)
+        self._dump_seq = 0
+        self.query_one("#dump", RichLog).clear()
+
+    def fill_conns(self, allowed: set) -> None:
+        """Connection table for the current focus; ``allowed`` = pair keys passing the filter."""
+        conns = [c for c in self.model.connections(self.focus_path.matches)
+                 if (c.client, c.server, c.server_port, c.proto) in allowed]
+        size = (lambda c: c.rate) if self.metric == METRIC_RATE else (lambda c: c.total)
+        order = {
+            "name": lambda c: (c.client, c.client_port or 0),
+            "port": lambda c: (c.server_port or 0, -size(c)),
+        }.get(self.sort_key, lambda c: -size(c))
+        conns.sort(key=order, reverse=self.sort_reverse)
+        table = self.query_one("#conns", DataTable)
+        row = table.cursor_row
+        table.clear()
+        self._conn_targets = []
+        now = time.monotonic()
+        names = self.resolver.name
+        for c in conns:
+            table.add_row(
+                proto_name(c.proto), names(c.client) or c.client, str(c.client_port or ""), "→",
+                names(c.server) or c.server, str(c.server_port or ""), service_name(c.server_port, c.proto),
+                c.state, fmt_rate(c.rate_up), fmt_rate(c.rate_down), fmt_bytes(c.up), fmt_bytes(c.down),
+                str(c.packets), _ago(now - c.first_seen), _ago(now - c.last_seen),
+            )
+            service = (c.server_port, c.proto) if self.focus_path.service or self.group_mode == GROUP_SERVICE else None
+            self._conn_targets.append(Focus(scope=c.scope, server=c.server, service=service, client=c.client))
+        if table.row_count:
+            table.move_cursor(row=min(row, table.row_count - 1))
+
+    def append_dump(self, allowed: set) -> None:
+        if self.paused:
+            return
+        log = self.query_one("#dump", RichLog)
+        show_payload = self.source.payload_bytes > 0
+        entries = self.model.dump_since(self._dump_seq)
+        for e in entries:
+            if e.pair in allowed:
+                log.write(dump_text(e, show_payload))
+        if entries:
+            self._dump_seq = entries[-1].seq
 
     def update_crumbs(self, groups) -> None:
         f = self.focus_path
@@ -278,7 +350,7 @@ class NetMonApp(App):
         self.query_one("#crumbs", Static).update(f"{crumbs}   [dim]{help_text}[/]")
 
     def fill_table(self, groups) -> None:
-        table = self.query_one(DataTable)
+        table = self.query_one("#table", DataTable)
         row = table.cursor_row
         table.clear()
         self._table_targets = []
@@ -299,6 +371,11 @@ class NetMonApp(App):
             table.move_cursor(row=min(row, table.row_count - 1))
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id == "conns":
+            if 0 <= event.cursor_row < len(self._conn_targets):
+                self.view = "map"
+                self.set_focus_path(self._conn_targets[event.cursor_row])
+            return
         if 0 <= event.cursor_row < len(self._table_targets):
             target = self._table_targets[event.cursor_row]
             if target != self.focus_path:
@@ -310,6 +387,7 @@ class NetMonApp(App):
         self.selected = selected
         self.hints = False
         self._hint_buffer = ""
+        self.update_watch()
         self.update_view()
 
     def select(self, key: tuple | None) -> None:
@@ -345,7 +423,7 @@ class NetMonApp(App):
 
     def action_move(self, direction: str) -> None:
         painter = self.query_one(TreemapView).painter
-        if painter is None or self.focus_path.level == LEVEL_CLIENT:
+        if painter is None or self.view != "map" or self.focus_path.level == LEVEL_CLIENT:
             return
         items = painter.selectables()
         keys = [h.key for h in items]
@@ -355,7 +433,7 @@ class NetMonApp(App):
             self.select(keys[i])
 
     def action_toggle_hints(self) -> None:
-        if self.focus_path.level == LEVEL_CLIENT or not self.query_one(TreemapView).display:
+        if self.view != "map" or self.focus_path.level == LEVEL_CLIENT:
             return
         self.hints = not self.hints
         self._hint_buffer = ""
@@ -393,6 +471,10 @@ class NetMonApp(App):
             parts.append("[yellow]input ended[/]")
         if self.paused:
             parts.append("[b yellow]PAUSED[/]")
+        if self.source.payload_bytes:
+            parts.append(f"[b red]payload {self.source.payload_bytes}B[/]")
+        if self.view != "map":
+            parts.append(f"view:{self.view}")
         arrow = "↑" if self.sort_reverse else "↓"
         geo_status = self.geo.status() if self.geo else None
         if geo_status:
@@ -456,12 +538,28 @@ class NetMonApp(App):
         self.set_focus_path(Focus(scope=PANE_CYCLE[(PANE_CYCLE.index(scope) + 1) % len(PANE_CYCLE)]))
 
     def action_toggle_table(self) -> None:
-        table = self.query_one(DataTable)
-        table.display = not table.display
+        self.action_view("map" if self.view == "table" else "table")
+
+    def action_view(self, view: str) -> None:
+        was_dump = self.view == "dump"
+        self.view = view
         self.hints = False
         self.update_panels()
-        (table if table.display else self.query_one(TreemapView)).focus()
+        if (view == "dump") != was_dump:
+            self.update_watch()
+        widget = {"table": "#table", "conns": "#conns", "dump": "#dump"}.get(view)
+        (self.query_one(widget) if widget else self.query_one(TreemapView)).focus()
         self.update_view()
+
+    def action_toggle_payload(self) -> None:
+        if self.source.payload_bytes:
+            self.source.payload_bytes = 0
+            self.notify("Payload capture off", timeout=3)
+        else:
+            self.source.payload_bytes = PAYLOAD_BYTES
+            self.notify(f"Payload capture on: the first {PAYLOAD_BYTES} bytes of each packet in focus are "
+                        "kept in memory and shown in the dump (3)", severity="warning", timeout=6)
+        self.update_status()
 
     def action_pause(self) -> None:
         self.paused = not self.paused
@@ -483,8 +581,8 @@ class NetMonApp(App):
 
     def _close_filter(self) -> None:
         self.query_one("#filter", Input).display = False
-        table = self.query_one(DataTable)
-        (table if table.display else self.query_one(TreemapView)).focus()
+        widget = {"table": "#table", "conns": "#conns", "dump": "#dump"}.get(self.view)
+        (self.query_one(widget) if widget else self.query_one(TreemapView)).focus()
 
     def apply_filter(self, text: str) -> None:
         try:

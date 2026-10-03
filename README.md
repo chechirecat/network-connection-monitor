@@ -47,7 +47,7 @@ sudo tcpdump -i any -U -w - | .venv/bin/netmon --pcap -       # UI unprivileged
 .venv/bin/netmon --pcap capture.pcap [--fast]                 # replay a file (pcap, not pcapng)
 ```
 
-Options: `--no-dns`, `--geoip FILE`, `--update-geoip`, `--no-geoip-update`, `--local-net CIDR` (repeatable), `--expire SEC`, `--interval SEC`.
+Options: `--payload`, `--no-dns`, `--geoip FILE`, `--update-geoip`, `--no-geoip-update`, `--local-net CIDR` (repeatable), `--expire SEC`, `--interval SEC`.
 
 ## Zooming
 
@@ -66,6 +66,21 @@ The view is a zoom stack, shown as a breadcrumb at the top: **All › Internet �
 - In the table (`t`), `Enter` on a row zooms into that server or client.
 - Filter, sort, size and color apply at every level.
 
+## Views
+
+Every view shows what is in the current zoom focus:
+
+| Key | View |
+|---|---|
+| `1` | map: the boxes; at client level, a detail page with a traffic graph of the last 2 minutes |
+| `2` | connections: one row per connection (client port ↔ server port) with TCP state (`syn`, `open`, `closing`, `closed`, `reset`, or `active` when the handshake wasn't seen), rates, totals, packets, age and idle time; `Enter` zooms into its client |
+| `3` | packet dump: time, direction (cyan = client → server, orange = back), TCP flags, seq/ack, payload length; `p` pauses so you can scroll |
+| `t` | summary table of servers and clients |
+
+Packets are recorded for the dump (last 2000) only while zoomed into a server or client, or while the dump is open.
+
+**Payload bytes are opt-in:** `x` (or `--payload`) keeps the first 64 bytes of each packet's payload and shows them as hex + text in the dump. They are held in memory only, never written to disk. Most internet traffic is encrypted, so this is mainly useful for plain protocols (HTTP, DNS, MQTT, …).
+
 ## Keys
 
 | Key | Action |
@@ -79,6 +94,8 @@ The view is a zoom stack, shown as a breadcrumb at the top: **All › Internet �
 | `v` | zoom to: all → intranet → internet |
 | `Space` / arrows + `Enter` / `Esc` | zoom with letters / select and zoom / back (see above) |
 | `t` | table view |
+| `1` / `2` / `3` | map / connections / packet dump |
+| `x` | payload capture on/off (first 64 bytes, opt-in) |
 | `p` / `z` / `q` | pause / reset totals / quit |
 
 Hover a box with the mouse for details.

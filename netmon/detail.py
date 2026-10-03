@@ -1,11 +1,15 @@
-"""Text for the deepest zoom level: one client talking to one server."""
+"""Text views: the client-level detail page, traffic graphs and dump lines."""
 
 from __future__ import annotations
 
+import time
+
 from rich.markup import escape
+from rich.text import Text
 
 from .geo import LOCAL, REGION_LABELS, region_of
-from .model import PairView
+from .model import DumpEntry, PairView
+from .packets import TCP, flags_text, proto_name
 from .render import fmt_bytes, fmt_rate
 from .views import NameLookup, service_name
 
@@ -24,7 +28,13 @@ def _endpoint(ip: str, names: NameLookup) -> str:
     return f"[b]{escape(name)}[/] ({ip})" if name else f"[b]{ip}[/]"
 
 
-def detail_markup(pairs: list[PairView], names: NameLookup, now: float) -> str:
+def detail_markup(
+    pairs: list[PairView],
+    names: NameLookup,
+    now: float,
+    history: list[tuple[float, float]] | None = None,
+    width: int = 80,
+) -> str:
     """Rich markup describing the given pairs (all between one client and one server)."""
     if not pairs:
         return "\n  [dim]No traffic between these hosts any more (idle pairs expire). Esc to go back.[/]"
@@ -57,5 +67,63 @@ def detail_markup(pairs: list[PairView], names: NameLookup, now: float) -> str:
             f"  {service_name(p.port, p.proto):<18} {p.conns:>5}   {fmt_rate(p.rate_up):<10}  "
             f"{fmt_rate(p.rate_down):<10}  {fmt_bytes(p.total):<10}  {ports}"
         )
-    lines += ["", "  [dim]Esc / Backspace: back · t: table[/]"]
+    if history:
+        lines += [""] + history_markup(history, max(width - 4, 10))
+    lines += ["", "  [dim]Esc / Backspace: back · 2: connections · 3: packet dump[/]"]
     return "\n".join(lines)
+
+
+BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+def bar_chart(values: list[float], width: int, height: int) -> list[str]:
+    """Rows (top first) of a bar chart of the last ``width`` values, using eighth blocks."""
+    values = values[-width:]
+    vmax = max(values, default=0.0)
+    rows = []
+    for row in range(height - 1, -1, -1):
+        line = []
+        for v in values:
+            eighths = round(v / vmax * height * 8) if vmax > 0 else 0
+            line.append(BLOCKS[min(max(eighths - row * 8, 0), 8)])
+        rows.append("".join(line).rjust(width))
+    return rows
+
+
+def history_markup(history: list[tuple[float, float]], width: int, height: int = 3) -> list[str]:
+    """Upload and download graphs (newest sample on the right), one second per column."""
+    out = []
+    for label, color, values in (
+        ("↑ up", "cyan", [h[0] for h in history]),
+        ("↓ down", "dark_orange", [h[1] for h in history]),
+    ):
+        peak = max(values, default=0.0)
+        out.append(f"  [b]{label}[/]  peak {fmt_rate(peak)} · last {len(values[-width:])}s")
+        out += [f"  [{color}]{row}[/]" for row in bar_chart(values, width, height)]
+    return out
+
+
+def dump_text(e: DumpEntry, show_payload: bool) -> Text:
+    """One dump entry as Rich Text (plus a hex dump when payload bytes were captured)."""
+    p = e.packet
+    ts = time.strftime("%H:%M:%S", time.localtime(e.time)) + f".{int(e.time * 1000) % 1000:03d}"
+    src = f"{p.src}:{p.sport}" if p.sport is not None else p.src
+    dst = f"{p.dst}:{p.dport}" if p.dport is not None else p.dst
+    t = Text()
+    t.append(ts + "  ", style="dim")
+    t.append(f"{src} → {dst}", style="cyan" if e.up else "dark_orange")
+    t.append(f"  {proto_name(p.proto)}")
+    if p.proto == TCP:
+        t.append(f" [{flags_text(p.tcp_flags) or '-'}]", style="bold")
+        if p.seq is not None:
+            t.append(f" seq {p.seq}", style="dim")
+        if p.ack and p.ack_no is not None:
+            t.append(f" ack {p.ack_no}", style="dim")
+    t.append(f"  len {p.payload_len}  ({p.length} B)")
+    if show_payload and p.payload:
+        for off in range(0, len(p.payload), 16):
+            chunk = p.payload[off : off + 16]
+            hexpart = " ".join(f"{b:02x}" for b in chunk)
+            asc = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+            t.append(f"\n      {off:04x}  {hexpart:<47}  {asc}", style="grey62")
+    return t
