@@ -14,6 +14,7 @@ import os
 import pwd
 import socket
 import threading
+import time
 import urllib.request
 from array import array
 from bisect import bisect_right
@@ -47,6 +48,7 @@ EASTERN_CCS = set("RU BY CN HK MO KP IR KZ UZ TM KG TJ SY CU VE MN".split())
 
 DBIP_URL = "https://download.db-ip.com/free/dbip-country-lite-{:%Y-%m}.csv.gz"
 DB_FILENAME = "dbip-country-lite.csv.gz"
+MAX_AGE_DAYS = 31  # DB-IP publishes a new database every month
 
 
 def region_of(cc: str | None) -> str:
@@ -77,14 +79,12 @@ def cache_dirs() -> list[Path]:
     return dirs
 
 
-def default_db_path() -> Path | None:
-    env = os.environ.get("NETMON_GEOIP")
-    if env:
-        return Path(env)
+def default_db_path() -> Path:
+    """Where the database is (or will be downloaded to)."""
     for d in cache_dirs():
         if (d / DB_FILENAME).exists():
             return d / DB_FILENAME
-    return None
+    return cache_dirs()[0] / DB_FILENAME
 
 
 def download(dest: Path | None = None) -> Path:
@@ -102,6 +102,9 @@ def download(dest: Path | None = None) -> Path:
         except OSError as e:
             last_error = e
             continue
+        if not data.startswith(b"\x1f\x8b"):
+            last_error = f"{url} did not return a gzip file"
+            continue
         tmp = dest.with_suffix(".tmp")
         tmp.write_bytes(data)
         tmp.replace(dest)
@@ -113,6 +116,13 @@ def download(dest: Path | None = None) -> Path:
     raise OSError(f"download failed: {last_error}")
 
 
+def file_age_days(path: Path) -> float | None:
+    try:
+        return (time.time() - path.stat().st_mtime) / 86400
+    except OSError:
+        return None
+
+
 def _ip_int(ip: str) -> tuple[int, int]:
     """IPv4 as a 32-bit int; IPv6 reduced to its /64 prefix so both fit in uint64 arrays
     (country ranges are never more specific than /64)."""
@@ -122,15 +132,19 @@ def _ip_int(ip: str) -> tuple[int, int]:
 
 
 class GeoDB:
-    """Sorted range table with binary search. Load in the background with ``load_async``."""
+    """Sorted range table with binary search. Load in the background with ``start``."""
 
     def __init__(self) -> None:
-        self._starts = {4: array("Q"), 6: array("Q")}
-        self._ends = {4: array("Q"), 6: array("Q")}
-        self._ccs = {4: b"", 6: b""}  # two ASCII bytes per range
+        empty = (array("Q"), array("Q"), b"")
+        # per IP version: (starts, ends, two ASCII bytes of country code per range);
+        # replaced as a whole so a reload never exposes mismatched arrays
+        self._tables = {4: empty, 6: empty}
         self.ready = False
-        self.error: str | None = None
         self.path: Path | None = None
+        self.age_days: float | None = None  # age of the file at startup
+        self.error: str | None = None
+        self.state = "idle"  # idle | loading | downloading | updated | update-failed
+        self.will_update = False
         self.country = lru_cache(maxsize=65536)(self._country)
 
     @classmethod
@@ -140,50 +154,93 @@ class GeoDB:
         return db
 
     def load(self, path: Path) -> None:
-        self.path = path
         opener = gzip.open if path.suffix == ".gz" else open
         with opener(path, "rt", newline="") as fh:
             self._load_rows(csv.reader(fh))
+        self.path = path
 
-    def load_async(self, path: Path) -> None:
+    def start(self, path: Path, update_to: Path | None = None, max_age_days: float = MAX_AGE_DAYS) -> None:
+        """Load ``path`` in a background thread. With ``update_to``, download a fresh
+        database there first if ``path`` is missing or older than ``max_age_days``."""
+        self.age_days = file_age_days(path)
+        stale = self.age_days is None or self.age_days > max_age_days
+        self.will_update = update_to is not None and stale
+        # set before the thread starts so callers never observe a stale "idle"
+        self.state = "loading" if self.age_days is not None else "downloading" if self.will_update else "idle"
+
         def run():
-            try:
-                self.load(path)
-            except (OSError, ValueError, csv.Error) as e:
-                self.error = f"geoip: {e}"
+            if self.age_days is not None:
+                try:
+                    self.load(path)
+                except (OSError, ValueError, csv.Error) as e:
+                    self.error = f"geoip: {e}"
+            if self.will_update:
+                self.state = "downloading"
+                try:
+                    self.load(download(update_to))
+                    self.error = None
+                    self.state = "updated"
+                    return
+                except (OSError, ValueError, csv.Error) as e:
+                    self.error = f"GeoIP download failed: {e}"
+                    self.state = "update-failed"
+                    return
+            self.state = "idle"
 
         threading.Thread(target=run, daemon=True, name="geoip").start()
 
+    @property
+    def stale(self) -> bool:
+        return self.age_days is not None and self.age_days > MAX_AGE_DAYS and self.state != "updated"
+
+    def status(self) -> tuple[str, str] | None:
+        """(severity, message) for the status bar, or None when all is well."""
+        age = f"{self.age_days:.0f} days old" if self.age_days is not None else ""
+        if self.state == "downloading":
+            return "warning", f"GeoIP db {age}, updating…" if age else "downloading GeoIP db…"
+        if self.state == "loading":
+            return "warning", "loading GeoIP…"
+        if self.error:
+            hint = f" (db {age})" if self.ready and age else ""
+            return "error", f"{self.error}{hint} — run netmon --update-geoip"
+        if self.stale:
+            return "warning", f"GeoIP db is {age}: run netmon --update-geoip"
+        return None
+
     def _load_rows(self, rows) -> None:
-        tables = {4: [], 6: []}
+        rows_by_version = {4: [], 6: []}
         for row in rows:
             if len(row) < 3:
                 continue
             v, start = _ip_int(row[0])
             _, end = _ip_int(row[1])
-            tables[v].append((start, end, row[2]))
-        for v, t in tables.items():
+            rows_by_version[v].append((start, end, row[2]))
+        tables = {}
+        for v, t in rows_by_version.items():
             t.sort()
-            self._starts[v] = array("Q", (r[0] for r in t))
-            self._ends[v] = array("Q", (r[1] for r in t))
-            self._ccs[v] = b"".join(r[2].encode("ascii")[:2].ljust(2) for r in t)
+            tables[v] = (
+                array("Q", (r[0] for r in t)),
+                array("Q", (r[1] for r in t)),
+                b"".join(r[2].encode("ascii")[:2].ljust(2) for r in t),
+            )
+        if not tables[4][0] and not tables[6][0]:
+            raise ValueError("no IP ranges in database")
+        self._tables = tables
         self.country.cache_clear()
         self.ready = True
 
     def _country(self, ip: str) -> str | None:
-        if not self.ready:
-            return None
         try:
             v, n = _ip_int(ip)
         except OSError:
             return None
-        i = bisect_right(self._starts[v], n) - 1
-        if i >= 0 and n <= self._ends[v][i]:
-            cc = self._ccs[v][2 * i : 2 * i + 2].decode("ascii")
+        starts, ends, ccs = self._tables[v]
+        i = bisect_right(starts, n) - 1
+        if i >= 0 and n <= ends[i]:
+            cc = ccs[2 * i : 2 * i + 2].decode("ascii")
             return None if cc == "ZZ" else cc
         return None
 
     def lookup(self, ip: str) -> str | None:
         # the lru cache must not remember misses from before the table finished loading
         return self.country(ip) if self.ready else None
-

@@ -31,6 +31,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="country range CSV (start,end,CC; .gz ok). Default: $NETMON_GEOIP or ~/.cache/netmon/")
     ap.add_argument("--update-geoip", action="store_true",
                     help="download the free DB-IP country database (CC BY 4.0, db-ip.com) and exit")
+    ap.add_argument("--no-geoip-update", action="store_true",
+                    help="don't download the country database automatically when missing or older than a month")
     ap.add_argument("--local-net", action="append", default=[], metavar="CIDR",
                     help="additional network to treat as intranet (repeatable)")
     ap.add_argument("--expire", type=float, default=60.0, metavar="SEC",
@@ -49,7 +51,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.update_geoip:
         try:
-            path = geo.download(Path(args.geoip) if args.geoip else None)
+            explicit = args.geoip or os.environ.get("NETMON_GEOIP")
+            path = geo.download(Path(explicit) if explicit else geo.default_db_path())
         except OSError as e:
             print(f"netmon: {e}", file=sys.stderr)
             return 1
@@ -79,19 +82,23 @@ def main(argv: list[str] | None = None) -> int:
 
     from .app import NetMonApp  # imported late so --help stays fast
 
-    geodb = load_geo(args)
-    model = TrafficModel(Classifier(args.local_net), geo=geodb.lookup if geodb else None, expire=args.expire)
+    geodb = load_geo(args)  # starts before the UI so a stale file can be refreshed meanwhile
+    model = TrafficModel(Classifier(args.local_net), geo=geodb.lookup, expire=args.expire)
     resolver = Resolver(enabled=not args.no_dns and not args.demo)
     NetMonApp(source, model, resolver, geo=geodb, interval=args.interval).run()
     return 0
 
 
-def load_geo(args) -> geo.GeoDB | None:
-    path = Path(args.geoip) if args.geoip else geo.default_db_path()
-    if path is None:
-        return geo.GeoDB.from_rows(DemoSource.GEO_ROWS) if args.demo else None
+def load_geo(args) -> geo.GeoDB:
+    """Start loading the country database; refresh it in the background when it is
+    missing or over a month old (only for the default cache location)."""
+    explicit = args.geoip or os.environ.get("NETMON_GEOIP")
+    path = Path(explicit) if explicit else geo.default_db_path()
+    if args.demo and not path.exists():
+        return geo.GeoDB.from_rows(DemoSource.GEO_ROWS)  # demo stays offline
     db = geo.GeoDB()
-    db.load_async(path)
+    auto = not explicit and not args.no_geoip_update
+    db.start(path, update_to=path if auto else None)
     return db
 
 

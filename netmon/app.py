@@ -6,6 +6,7 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
+from textual.css.query import NoMatches
 from textual.strip import Strip
 from textual.widget import Widget
 from textual.widgets import DataTable, Footer, Input, Static
@@ -13,7 +14,7 @@ from textual.widgets import DataTable, Footer, Input, Static
 from .classify import INTERNET, INTRANET
 from .filters import FilterError, parse_filter
 from .model import PairView, TrafficModel
-from .geo import REGION_LABELS, GeoDB
+from .geo import MAX_AGE_DAYS, REGION_LABELS, GeoDB
 from .render import (
     COLOR_GEO,
     COLOR_PROTO,
@@ -115,6 +116,7 @@ class NetMonApp(App):
     ) -> None:
         super().__init__()
         self.geo = geo
+        self._geo_state = geo.state if geo else None
         self.source = source
         self.model = model
         self.resolver = resolver
@@ -148,15 +150,23 @@ class NetMonApp(App):
         self.source.start(self.model.add)
         self.set_interval(self.interval, self.tick)
         self.tick()
+        if self.geo and self.geo.age_days is not None and self.geo.age_days > MAX_AGE_DAYS:
+            action = "updating in the background" if self.geo.will_update else "run netmon --update-geoip"
+            self.notify(f"GeoIP database is {self.geo.age_days:.0f} days old — {action}",
+                        title="Outdated country data", severity="warning", timeout=10)
 
     # -- data ------------------------------------------------------------
     def tick(self) -> None:
-        pairs = self.model.tick()
-        if not self.paused:
-            self.pairs = pairs
-            self.update_view()
-        else:
-            self.update_status()
+        try:
+            self.check_geo_update()
+            pairs = self.model.tick()
+            if not self.paused:
+                self.pairs = pairs
+                self.update_view()
+            else:
+                self.update_status()
+        except NoMatches:
+            pass  # timer fired while the app is shutting down and widgets are gone
 
     def update_view(self) -> None:
         pairs = self.pairs
@@ -199,12 +209,10 @@ class NetMonApp(App):
         if self.paused:
             parts.append("[b yellow]PAUSED[/]")
         arrow = "↑" if self.sort_reverse else "↓"
-        if self.geo is None:
-            parts.append("[yellow]no GeoIP db: netmon --update-geoip[/]")
-        elif self.geo.error:
-            parts.append(f"[red]{self.geo.error}[/]")
-        elif not self.geo.ready:
-            parts.append("[yellow]loading GeoIP…[/]")
+        geo_status = self.geo.status() if self.geo else None
+        if geo_status:
+            color = "red" if geo_status[0] == "error" else "yellow"
+            parts.append(f"[{color}]{geo_status[1]}[/]")
         parts += [
             f"size:{self.metric}/{self.scale}",
             f"color:{self.color}",
@@ -218,6 +226,17 @@ class NetMonApp(App):
             n = f" ({shown}/{len(self.pairs)} pairs)" if shown is not None else ""
             parts.append(f"[cyan]filter: {self.filter_text}{n}[/]")
         self.query_one("#status", Static).update(" │ ".join(parts))
+
+    def check_geo_update(self) -> None:
+        """Announce once when a background GeoIP download finishes or fails."""
+        state = self.geo.state if self.geo else None
+        if state == self._geo_state:
+            return
+        if state == "updated":
+            self.notify("GeoIP database updated", timeout=5)
+        elif state == "update-failed":
+            self.notify(self.geo.error or "GeoIP download failed", severity="error", timeout=10)
+        self._geo_state = state
 
     def hover(self, text: str) -> None:
         self.query_one("#hover", Static).update(text)

@@ -21,11 +21,14 @@ The remote end of each connection is looked up offline by country:
 
 Brightness of a client box shows its traffic. The country lists are in `netmon/geo.py`.
 
+The database is [IP to Country Lite by DB-IP](https://db-ip.com), licensed CC BY 4.0, published monthly. netmon keeps it in `~/.cache/netmon/` (under `sudo`, the invoking user's cache) and **downloads it in the background on start when it is missing or older than 31 days**; the UI keeps running with the old data meanwhile. A file older than a month triggers a warning on startup and stays flagged in the status bar until it is refreshed.
+
 ```sh
-.venv/bin/netmon --update-geoip     # downloads DB-IP country lite into ~/.cache/netmon/
+.venv/bin/netmon --update-geoip      # download now and exit
+.venv/bin/netmon --no-geoip-update   # never download automatically (still warns when outdated)
 ```
 
-The database is [IP to Country Lite by DB-IP](https://db-ip.com), licensed CC BY 4.0; it is updated monthly. Under `sudo`, the invoking user's cache is used. `--geoip FILE` or `$NETMON_GEOIP` points at any `start,end,CC` CSV (optionally gzipped).
+`--geoip FILE` or `$NETMON_GEOIP` points at any `start,end,CC` CSV (optionally gzipped); such files are never auto-downloaded, only checked for age. `--demo` never downloads.
 
 ## Setup
 
@@ -44,7 +47,7 @@ sudo tcpdump -i any -U -w - | .venv/bin/netmon --pcap -       # UI unprivileged
 .venv/bin/netmon --pcap capture.pcap [--fast]                 # replay a file (pcap, not pcapng)
 ```
 
-Options: `--no-dns`, `--geoip FILE`, `--update-geoip`, `--local-net CIDR` (repeatable), `--expire SEC`, `--interval SEC`.
+Options: `--no-dns`, `--geoip FILE`, `--update-geoip`, `--no-geoip-update`, `--local-net CIDR` (repeatable), `--expire SEC`, `--interval SEC`.
 
 ## Keys
 
