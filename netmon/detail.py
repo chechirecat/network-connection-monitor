@@ -34,6 +34,7 @@ def detail_markup(
     now: float,
     history: list[tuple[float, float]] | None = None,
     width: int = 80,
+    hostnames=None,
 ) -> str:
     """Rich markup describing the given pairs (all between one client and one server)."""
     if not pairs:
@@ -67,10 +68,31 @@ def detail_markup(
             f"  {service_name(p.port, p.proto):<18} {p.conns:>5}   {fmt_rate(p.rate_up):<10}  "
             f"{fmt_rate(p.rate_down):<10}  {fmt_bytes(p.total):<10}  {ports}"
         )
+    if hostnames is not None:
+        lines += [""] + names_markup(first, hostnames, names)
     if history:
         lines += [""] + history_markup(history, max(width - 4, 10))
     lines += ["", "  [dim]Esc / Backspace: back · 2: connections · 3: packet dump[/]"]
     return "\n".join(lines)
+
+
+def names_markup(pair: PairView, hostnames, names: NameLookup) -> list[str]:
+    """Which names point at the server, and where each was learned."""
+    infos = hostnames.names(pair.server)
+    ptr = names(pair.server) if not infos else None
+    lines = ["  [b]names for the server[/]"]
+    if not infos and not ptr:
+        lines.append("  [dim]none learned yet — names come from TLS ClientHellos (SNI) and DNS answers of new "
+                     "connections; QUIC, DNS-over-HTTPS and ECH hide them[/]")
+    for i in infos[:8]:
+        lines.append(f"  {escape(i.name):<40} [dim]{i.source}, seen {i.count}×[/]")
+    if len(infos) > 8:
+        lines.append(f"  [dim]+{len(infos) - 8} more[/]")
+    if ptr:
+        lines.append(f"  {escape(ptr):<40} [dim]reverse DNS[/]")
+    if len([i for i in infos if i.source != "TLS ECH (decoy)"]) > 1:
+        lines.append("  [dim]several sites share this address (typical for CDNs such as Cloudflare)[/]")
+    return lines
 
 
 BLOCKS = " ▁▂▃▄▅▆▇█"

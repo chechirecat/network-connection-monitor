@@ -5,6 +5,7 @@ from __future__ import annotations
 import socket
 import struct
 from dataclasses import dataclass
+from typing import Callable
 
 TCP = 6
 UDP = 17
@@ -74,20 +75,29 @@ def flags_text(flags: int) -> str:
     return out + ("." if flags & TCP_ACK else "")
 
 
-def parse_ip(data: bytes | memoryview, payload: int = 0) -> Packet | None:
+# Callback deciding whether a TCP segment continues a TLS ClientHello being collected
+# (src, sport, dst, dport) -> bool; see hostnames.HostNames.wants_payload.
+Sniff = Callable[[str, int, str, int], bool]
+
+SNIFF_TLS_BYTES = 16384  # full ClientHello segments
+SNIFF_DNS_BYTES = 4096  # DNS responses
+
+
+def parse_ip(data: bytes | memoryview, payload: int = 0, sniff: Sniff | None = None) -> Packet | None:
     """Parse a packet starting at the IP header (version is taken from the first nibble).
-    ``payload`` > 0 keeps up to that many bytes of the transport payload."""
+    ``payload`` > 0 keeps up to that many bytes of the transport payload. With ``sniff``,
+    TLS ClientHellos and DNS responses are kept in full so hostnames can be learned."""
     if len(data) < 1:
         return None
     version = data[0] >> 4
     if version == 4:
-        return _parse_ipv4(data, payload)
+        return _parse_ipv4(data, payload, sniff)
     if version == 6:
-        return _parse_ipv6(data, payload)
+        return _parse_ipv6(data, payload, sniff)
     return None
 
 
-def _parse_ipv4(data: bytes | memoryview, keep: int) -> Packet | None:
+def _parse_ipv4(data: bytes | memoryview, keep: int, sniff: Sniff | None) -> Packet | None:
     if len(data) < 20:
         return None
     ihl = (data[0] & 0x0F) * 4
@@ -99,10 +109,10 @@ def _parse_ipv4(data: bytes | memoryview, keep: int) -> Packet | None:
     dst = socket.inet_ntop(socket.AF_INET, bytes(data[16:20]))
     length = total_len or len(data)  # total_len is 0 for some offloaded (TSO) packets
     first_fragment = (frag & 0x1FFF) == 0
-    return _parse_l4(data, ihl if first_fragment else None, proto, src, dst, length, keep)
+    return _parse_l4(data, ihl if first_fragment else None, proto, src, dst, length, keep, sniff)
 
 
-def _parse_ipv6(data: bytes | memoryview, keep: int) -> Packet | None:
+def _parse_ipv6(data: bytes | memoryview, keep: int, sniff: Sniff | None) -> Packet | None:
     if len(data) < 40:
         return None
     (payload_len,) = struct.unpack_from("!H", data, 4)
@@ -122,10 +132,12 @@ def _parse_ipv6(data: bytes | memoryview, keep: int) -> Packet | None:
         else:
             nxt, ext_len = data[off], (data[off + 1] + 1) * 8
             off += ext_len
-    return _parse_l4(data, off, nxt, src, dst, length, keep)
+    return _parse_l4(data, off, nxt, src, dst, length, keep, sniff)
 
 
-def _parse_l4(data, off: int | None, proto: int, src: str, dst: str, length: int, keep: int = 0) -> Packet:
+def _parse_l4(
+    data, off: int | None, proto: int, src: str, dst: str, length: int, keep: int = 0, sniff: Sniff | None = None
+) -> Packet:
     sport = dport = seq = ack_no = None
     flags = 0
     payload_off = None
@@ -141,6 +153,16 @@ def _parse_l4(data, off: int | None, proto: int, src: str, dst: str, length: int
         payload_off = off  # ICMP and others: everything after the IP header
     # payload length from the IP lengths, so it is right even for truncated captures
     payload_len = max(length - payload_off, 0) if payload_off is not None else 0
+    if sniff is not None and payload_len:
+        if proto == TCP:
+            head = data[payload_off : payload_off + 6]
+            # TLS handshake record carrying a ClientHello, or the rest of one being collected
+            if (len(head) == 6 and head[0] == 0x16 and head[1] == 0x03 and head[5] == 0x01) or sniff(
+                src, sport, dst, dport
+            ):
+                keep = max(keep, SNIFF_TLS_BYTES)
+        elif proto == UDP and sport == 53:
+            keep = max(keep, SNIFF_DNS_BYTES)
     payload = bytes(data[payload_off : payload_off + min(keep, payload_len)]) if keep and payload_off is not None else b""
     return Packet(
         src, dst, proto, sport, dport, length,
@@ -149,7 +171,7 @@ def _parse_l4(data, off: int | None, proto: int, src: str, dst: str, length: int
     )
 
 
-def parse_ethernet(frame: bytes | memoryview, payload: int = 0) -> Packet | None:
+def parse_ethernet(frame: bytes | memoryview, payload: int = 0, sniff: Sniff | None = None) -> Packet | None:
     if len(frame) < 14:
         return None
     off = 12
@@ -159,25 +181,27 @@ def parse_ethernet(frame: bytes | memoryview, payload: int = 0) -> Packet | None
         (ethertype,) = struct.unpack_from("!H", frame, off)
     if ethertype not in (ETH_P_IP, ETH_P_IPV6):
         return None
-    return parse_ip(frame[off + 2 :], payload)
+    return parse_ip(frame[off + 2 :], payload, sniff)
 
 
-def parse_frame(frame: bytes | memoryview, linktype: int, payload: int = 0) -> Packet | None:
+def parse_frame(
+    frame: bytes | memoryview, linktype: int, payload: int = 0, sniff: Sniff | None = None
+) -> Packet | None:
     """Parse a captured frame of the given pcap link type."""
     if linktype == LINKTYPE_ETHERNET:
-        return parse_ethernet(frame, payload)
+        return parse_ethernet(frame, payload, sniff)
     if linktype in (LINKTYPE_RAW, LINKTYPE_IPV4, LINKTYPE_IPV6):
-        return parse_ip(frame, payload)
+        return parse_ip(frame, payload, sniff)
     if linktype == LINKTYPE_LINUX_SLL:
         if len(frame) < 16:
             return None
         (ethertype,) = struct.unpack_from("!H", frame, 14)
-        return parse_ip(frame[16:], payload) if ethertype in (ETH_P_IP, ETH_P_IPV6) else None
+        return parse_ip(frame[16:], payload, sniff) if ethertype in (ETH_P_IP, ETH_P_IPV6) else None
     if linktype == LINKTYPE_LINUX_SLL2:
         if len(frame) < 20:
             return None
         (ethertype,) = struct.unpack_from("!H", frame, 0)
-        return parse_ip(frame[20:], payload) if ethertype in (ETH_P_IP, ETH_P_IPV6) else None
+        return parse_ip(frame[20:], payload, sniff) if ethertype in (ETH_P_IP, ETH_P_IPV6) else None
     if linktype == LINKTYPE_NULL:
-        return parse_ip(frame[4:], payload)
+        return parse_ip(frame[4:], payload, sniff)
     return None

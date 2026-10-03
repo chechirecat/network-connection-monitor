@@ -11,6 +11,7 @@ import threading
 import time
 from typing import BinaryIO, Callable
 
+from .hostnames import build_client_hello, build_dns_response
 from .packets import TCP, TCP_ACK, TCP_FIN, TCP_PSH, TCP_SYN, UDP, Packet, parse_frame, parse_ip
 
 Sink = Callable[[Packet], None]
@@ -28,6 +29,7 @@ class Source:
 
     def __init__(self) -> None:
         self.payload_bytes = 0  # >0: keep that many payload bytes per packet (dump view, opt-in)
+        self.sniff = None  # packets.Sniff: keep TLS ClientHellos / DNS answers for hostname learning
         self.finished = False
         self.error: str | None = None
         self._stop = threading.Event()
@@ -85,7 +87,7 @@ class LiveSource(Source):
             # Loopback traffic shows up twice (outgoing + incoming); keep one copy.
             if addr[2] == PACKET_OUTGOING and addr[0] == "lo":
                 continue
-            pkt = parse_ip(view[:n], self.payload_bytes)
+            pkt = parse_ip(view[:n], self.payload_bytes, self.sniff)
             if pkt is not None:
                 sink(pkt)
         self.sock.close()
@@ -141,7 +143,7 @@ class PcapSource(Source):
                 delay = (ts - first_ts) - (time.monotonic() - start)
                 if delay > 0 and self._stop.wait(delay):
                     break
-            pkt = parse_frame(frame, self.linktype, self.payload_bytes)
+            pkt = parse_frame(frame, self.linktype, self.payload_bytes, self.sniff)
             if pkt is not None:
                 sink(pkt)
 
@@ -181,6 +183,16 @@ class DemoSource(Source):
     ]
     # a host on the internet using a server in the LAN (port forward)
     INBOUND = [("203.0.113.50", "192.168.1.42", 32400, TCP, 300_000)]
+    # Names announced in TLS ClientHellos (SNI) / DNS answers; 162.159.135.234 is QUIC (UDP),
+    # whose hello is encrypted, so it is only named through the DNS answer.
+    SNI = {
+        "142.250.185.78": "www.google.com", "140.82.121.4": "github.com", "151.101.1.140": "www.reddit.com",
+        "104.16.132.229": "discord.com", "1.1.1.1": "one.one.one.one", "52.84.150.11": "d3f8ab2c1.cloudfront.net",
+        "46.4.0.10": "cloud.example.de", "77.88.55.88": "yandex.ru", "220.181.38.148": "www.baidu.com",
+        "200.147.67.142": "www.uol.com.br", "31.13.84.36": "www.facebook.com",
+    }
+    DNS = {"162.159.135.234": "discord.media", "91.189.91.38": "archive.ubuntu.com",
+           "185.199.108.153": "objects.githubusercontent.com"}
     # Fallback countries when no GeoIP database is installed (also used by tests).
     GEO_ROWS = [
         (ip, ip, cc)
@@ -205,6 +217,10 @@ class DemoSource(Source):
             flows.append([client, rng.randint(32768, 60999), server, port, proto, rate, 1.0, None])
         for f in flows:
             self._open(sink, f)
+        # the LAN's DNS lookups for the servers that are only named via DNS
+        for ip, name in self.DNS.items():
+            dns = build_dns_response(name, [ip])
+            sink(Packet("192.168.1.1", self.LAN[0], UDP, 53, 40000, 28 + len(dns), payload_len=len(dns), payload=dns))
         dt = 0.1
         while not self._stop.wait(dt):
             if rng.random() < 0.05:  # short-lived extra connection
@@ -253,11 +269,14 @@ class DemoSource(Source):
             for src, dst, sp, dp in ((client, server, cport, sport), (server, client, sport, cport)):
                 sink(Packet(src, dst, proto, sp, dp, 52, ack=True, tcp_flags=TCP_FIN | TCP_ACK))
 
-    @staticmethod
-    def _open(sink: Sink, f) -> None:
+    def _open(self, sink: Sink, f) -> None:
         client, cport, server, sport, proto = f[:5]
         if proto == TCP:
             sink(Packet(client, server, proto, cport, sport, 60, syn=True, tcp_flags=TCP_SYN))
             sink(Packet(server, client, proto, sport, cport, 60, syn=True, ack=True, tcp_flags=TCP_SYN | TCP_ACK))
+            if server in self.SNI and sport in (443, 853, 993):
+                hello = build_client_hello(self.SNI[server])
+                sink(Packet(client, server, proto, cport, sport, 52 + len(hello), ack=True,
+                            tcp_flags=TCP_PSH | TCP_ACK, seq=1, payload_len=len(hello), payload=hello))
         else:
             sink(Packet(client, server, proto, cport, sport, 60))

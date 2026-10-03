@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 
 from rich.markup import escape
 from textual import events
@@ -21,6 +22,7 @@ from .filters import FilterError, parse_filter
 from .model import PairView, TrafficModel
 from .packets import proto_name
 from .geo import MAX_AGE_DAYS, REGION_LABELS, GeoDB
+from .hostnames import HostNames
 from .render import (
     COLOR_GEO,
     COLOR_PROTO,
@@ -164,9 +166,18 @@ class NetMonApp(App):
     ]
 
     def __init__(
-        self, source: Source, model: TrafficModel, resolver: Resolver, geo: GeoDB | None = None, interval: float = 1.0
+        self,
+        source: Source,
+        model: TrafficModel,
+        resolver: Resolver,
+        geo: GeoDB | None = None,
+        interval: float = 1.0,
+        hostnames: HostNames | None = None,
     ) -> None:
         super().__init__()
+        self.hostnames = hostnames or HostNames(enabled=False)
+        if self.hostnames.enabled:
+            source.sniff = self.hostnames.wants_payload
         self.geo = geo
         self._geo_state = geo.state if geo else None
         self.source = source
@@ -211,11 +222,11 @@ class NetMonApp(App):
         table = self.query_one("#table", DataTable)
         table.add_columns("Scope", "Server", "Geo", "Services", "Clients", "Conns", "↑ /s", "↓ /s", "Σ total")
         self.query_one("#conns", DataTable).add_columns(
-            "Proto", "Client", "Port", "", "Server", "Port", "Service", "State",
+            "Proto", "Client", "Port", "", "Server", "Port", "Service", "Host (TLS SNI)", "State",
             "↑ /s", "↓ /s", "Σ ↑", "Σ ↓", "Pkts", "Age", "Idle",
         )
         self.update_watch()
-        self.source.start(self.model.add)
+        self.source.start(self.ingest)
         self.set_interval(self.interval, self.tick)
         self.tick()
         if self.geo and self.geo.age_days is not None and self.geo.age_days > MAX_AGE_DAYS:
@@ -236,8 +247,22 @@ class NetMonApp(App):
         except NoMatches:
             pass  # timer fired while the app is shutting down and widgets are gone
 
+    def ingest(self, p) -> None:
+        """Capture-thread sink: learn hostnames, then account the packet. Payload bytes kept only
+        for hostname learning are dropped (or cut to the opt-in size) before the dump can see them."""
+        if p.payload:
+            self.hostnames.observe(p)
+            keep = self.source.payload_bytes
+            if len(p.payload) > keep:
+                p = replace(p, payload=p.payload[:keep])
+        self.model.add(p)
+
+    def names(self, ip: str) -> str | None:
+        """Display name: learned from traffic (SNI/DNS) first, then reverse DNS."""
+        return self.hostnames.best(ip) or self.resolver.name(ip)
+
     def update_view(self) -> None:
-        names = self.resolver.name
+        names = self.names
         focus = self.focus_path
         pairs = [p for p in self.pairs if focus.matches(p)]
         if self.filter_pred:
@@ -267,7 +292,7 @@ class NetMonApp(App):
             detail = self.query_one("#detail", Static)
             history = self.model.history(focus.matches)
             width = detail.size.width or self.size.width
-            detail.update(detail_markup(pairs, names, time.monotonic(), history, width))
+            detail.update(detail_markup(pairs, names, time.monotonic(), history, width, self.hostnames))
         self.update_crumbs(groups)
         self.update_status(len(pairs))
 
@@ -302,11 +327,13 @@ class NetMonApp(App):
         table.clear()
         self._conn_targets = []
         now = time.monotonic()
-        names = self.resolver.name
+        names = self.names
         for c in conns:
+            hello = self.hostnames.connection(c.client, c.client_port, c.server, c.server_port)
+            host = (hello.sni or "") + (" (ECH decoy)" if hello.ech else "") if hello else ""
             table.add_row(
                 proto_name(c.proto), names(c.client) or c.client, str(c.client_port or ""), "→",
-                names(c.server) or c.server, str(c.server_port or ""), service_name(c.server_port, c.proto),
+                c.server, str(c.server_port or ""), service_name(c.server_port, c.proto), host,
                 c.state, fmt_rate(c.rate_up), fmt_rate(c.rate_down), fmt_bytes(c.up), fmt_bytes(c.down),
                 str(c.packets), _ago(now - c.first_seen), _ago(now - c.last_seen),
             )
@@ -335,11 +362,11 @@ class NetMonApp(App):
         if f.server:
             g = groups[0] if groups else None
             cc = f"{g.cc} " if g and g.server_is_remote and g.cc else ""
-            label = g.label if g else (self.resolver.name(f.server) or f.server)
+            label = g.label if g else (self.names(f.server) or f.server)
             svc = f" {service_name(*f.service)}" if f.service else ""
             parts.append(f"{cc}{label}{svc}")
         if f.client:
-            parts.append(self.resolver.name(f.client) or f.client)
+            parts.append(self.names(f.client) or f.client)
         crumbs = " › ".join(f"[b]{escape(p)}[/]" if i == len(parts) - 1 else escape(p) for i, p in enumerate(parts))
         if self.hints:
             help_text = f"type letters to zoom{' — ' + self._hint_buffer if self._hint_buffer else ''} · Esc cancel"

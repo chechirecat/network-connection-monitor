@@ -138,3 +138,19 @@ async def test_connections_and_dump_views():
         await pilot.pause()
         assert app.source.payload_bytes == 0 and app.focus_path.level == LEVEL_ALL
         assert app.model.watch is None  # back at the top: recording stopped
+
+
+async def test_hostnames_label_boxes_and_payload_stays_opt_in():
+    from netmon.hostnames import HostNames
+
+    app = NetMonApp(DemoSource(), TrafficModel(), Resolver(enabled=False), interval=0.2, hostnames=HostNames())
+    async with app.run_test(size=(160, 45)) as pilot:
+        await asyncio.sleep(1.0)
+        await pilot.pause()
+        assert app.names("142.250.185.78") == "www.google.com"  # from the demo's TLS ClientHello
+        assert app.names("162.159.135.234") == "discord.media"  # QUIC: only via DNS
+        assert "www.google.com" in _screen(app)
+        # hello bytes were used for the name, but the dump never got them (payload is opt-in)
+        app.model.set_watch(lambda p: True)
+        await asyncio.sleep(0.5)
+        assert all(not e.packet.payload for e in app.model.dump)

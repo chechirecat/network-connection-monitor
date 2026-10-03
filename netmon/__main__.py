@@ -10,6 +10,7 @@ from pathlib import Path
 
 from . import geo
 from .classify import Classifier
+from .hostnames import HostNames
 from .model import TrafficModel
 from .resolver import Resolver
 from .sources import DemoSource, LiveSource, PcapSource, SourceError
@@ -27,6 +28,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     src.add_argument("--demo", action="store_true", help="show synthetic traffic (no root needed)")
     ap.add_argument("--fast", action="store_true", help="with --pcap FILE: load as fast as possible instead of replaying")
     ap.add_argument("--no-dns", action="store_true", help="disable reverse DNS lookups")
+    ap.add_argument("--no-hostnames", action="store_true",
+                    help="don't learn hostnames from TLS ClientHellos (SNI) and DNS answers in the traffic")
     ap.add_argument("--payload", action="store_true",
                     help="start with payload capture on: the dump shows the first 64 bytes of each packet (key x)")
     ap.add_argument("--geoip", metavar="FILE",
@@ -91,7 +94,8 @@ def main(argv: list[str] | None = None) -> int:
     geodb = load_geo(args)  # starts before the UI so a stale file can be refreshed meanwhile
     model = TrafficModel(Classifier(args.local_net), geo=geodb.lookup, expire=args.expire)
     resolver = Resolver(enabled=not args.no_dns and not args.demo)
-    NetMonApp(source, model, resolver, geo=geodb, interval=args.interval).run()
+    hostnames = HostNames(enabled=not args.no_hostnames)
+    NetMonApp(source, model, resolver, geo=geodb, interval=args.interval, hostnames=hostnames).run()
     return 0
 
 

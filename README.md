@@ -6,6 +6,17 @@ A client↔server pair is *intranet* when both ends are local (RFC1918, loopback
 
 Boxes have a minimum size (server 18×4, client 14×2 cells); whatever doesn't fit is merged into a "+N more" box. If only one client fits, it shows a "+N more clients" line instead.
 
+## Hostnames from traffic
+
+Shared addresses (CDNs like Cloudflare, Akamai, CloudFront) say little about the service behind them, so netmon learns names from the traffic itself:
+
+- **TLS SNI**: every encrypted TCP connection starts with a ClientHello that names the site in plain text, also when it spans several packets.
+- **DNS answers**: plain DNS responses map addresses to the names that were looked up.
+
+Learned names replace reverse DNS in box labels (`discord.com +2` = three sites seen on that address). The connections view (`2`) shows the exact SNI per connection, and the client detail page lists every name with its source. Only those handshake/DNS bytes are read for this; they are not shown in the dump unless payload capture (`x`) is on. `--no-hostnames` turns it off.
+
+Not visible: QUIC/HTTP3 (UDP 443) encrypts its hello; DNS over HTTPS/TLS; and Encrypted Client Hello (ECH, used by browsers for Cloudflare sites) sends the decoy `cloudflare-ech.com`. It is recorded as such, but a DNS name for the same address wins. Names appear for **new** connections, so restart an app to see its existing ones named.
+
 ## Distance colors (GeoIP)
 
 The remote end of each connection is looked up offline by country:
@@ -47,7 +58,7 @@ sudo tcpdump -i any -U -w - | .venv/bin/netmon --pcap -       # UI unprivileged
 .venv/bin/netmon --pcap capture.pcap [--fast]                 # replay a file (pcap, not pcapng)
 ```
 
-Options: `--payload`, `--no-dns`, `--geoip FILE`, `--update-geoip`, `--no-geoip-update`, `--local-net CIDR` (repeatable), `--expire SEC`, `--interval SEC`.
+Options: `--payload`, `--no-hostnames`, `--no-dns`, `--geoip FILE`, `--update-geoip`, `--no-geoip-update`, `--local-net CIDR` (repeatable), `--expire SEC`, `--interval SEC`.
 
 ## Zooming
 
