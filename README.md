@@ -86,9 +86,21 @@ Every view shows what is in the current zoom focus:
 | `1` | map: the boxes; at client level, a detail page with a traffic graph of the last 2 minutes |
 | `2` | connections: one row per connection (client port ↔ server port) with TCP state (`syn`, `open`, `closing`, `closed`, `reset`, or `active` when the handshake wasn't seen), rates, totals, packets, age and idle time; `Enter` zooms into its client |
 | `3` | packet dump: time, direction (cyan = client → server, orange = back), TCP flags, seq/ack, payload length; `p` pauses so you can scroll |
+| `4` | stream: follow one connection and read its reassembled payload (see below) |
 | `t` | summary table of servers and clients |
 
 Packets are recorded for the dump (last 2000) only while zoomed into a server or client, or while the dump is open.
+
+### Following a stream
+
+In the connections view (`2`), select a row and press `f` (or press `4` to follow the busiest connection in focus). netmon then collects the full payload of **that one connection** and puts it back together like Wireshark's "Follow TCP stream":
+
+- each direction is reassembled by TCP sequence number; out-of-order segments wait for the hole before them, retransmitted bytes are counted once, and a hole still open after 1 s is shown as `[gap: N bytes missing]`;
+- the overview bars show, per direction, which byte ranges arrived (█), are missing (░ red) or are waiting out of order (▒ yellow), plus totals for gaps, retransmissions and reordering;
+- the conversation is shown in order, client → server in cyan, server → client in orange, as text or hex (`h`); encrypted/binary data is summarized in text mode;
+- UDP is shown datagram by datagram.
+
+Following starts with the next packet, so data sent earlier is not shown (marked "joined mid-connection"). The payload is kept in memory only while the stream view is open, at most 1 MiB per direction, and is discarded when you leave it (`Esc` goes back to the connections). Most internet traffic is TLS-encrypted, so this is most useful for plain protocols, local devices and the start of a TLS handshake.
 
 **Payload bytes are opt-in:** `x` (or `--payload`) keeps the first 64 bytes of each packet's payload and shows them as hex + text in the dump. They are held in memory only, never written to disk. Most internet traffic is encrypted, so this is mainly useful for plain protocols (HTTP, DNS, MQTT, …).
 
@@ -105,7 +117,8 @@ Packets are recorded for the dump (last 2000) only while zoomed into a server or
 | `v` | zoom to: all → intranet → internet |
 | `Space` / arrows + `Enter` / `Esc` | zoom with letters / select and zoom / back (see above) |
 | `t` | table view |
-| `1` / `2` / `3` | map / connections / packet dump |
+| `1` / `2` / `3` / `4` | map / connections / packet dump / stream |
+| `f` / `h` | follow the selected connection's stream / hex ↔ text in the stream view |
 | `x` | payload capture on/off (first 64 bytes, opt-in) |
 | `p` / `z` / `q` | pause / reset totals / quit |
 

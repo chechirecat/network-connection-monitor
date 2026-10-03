@@ -149,3 +149,120 @@ def dump_text(e: DumpEntry, show_payload: bool) -> Text:
             asc = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
             t.append(f"\n      {off:04x}  {hexpart:<47}  {asc}", style="grey62")
     return t
+
+
+# -- stream view ---------------------------------------------------------------------
+STREAM_TEXT_LIMIT = 4000  # characters shown per chunk in text mode
+STREAM_HEX_LIMIT = 1024  # bytes shown per chunk in hex mode
+
+
+def _overview_bar(d, width: int, extent: int) -> str:
+    """One cell per extent/width bytes: █ received, ░ gap (red), ▒ held out of order (yellow)."""
+    if extent <= 0 or width <= 0:
+        return " " * max(width, 0)
+    cells = [" "] * width
+    rank = {" ": 0, "█": 1, "▒": 2, "░": 3}
+
+    def paint(start: int, end: int, ch: str) -> None:
+        a = max(int(start * width / extent), 0)
+        b = min(max(int((end - 1) * width / extent), a), width - 1)
+        for i in range(a, b + 1):
+            if rank[ch] > rank[cells[i]]:
+                cells[i] = ch
+
+    for start, end, kind in d.ranges:
+        paint(start, end, "░" if kind == "gap" else "█")
+    for off, (data, _) in d.held.items():
+        paint(off, off + len(data), "▒")
+    out, prev = [], None
+    for ch in cells:
+        style = {"█": "green", "░": "red", "▒": "yellow"}.get(ch)
+        if ch != prev:
+            if prev is not None and prev != " ":
+                out.append("[/]")
+            if style:
+                out.append(f"[{style}]")
+            prev = ch
+        out.append(ch)
+    if prev not in (None, " "):
+        out.append("[/]")
+    return "".join(out)
+
+
+def stream_header_markup(follower, names: NameLookup, width: int, hex_mode: bool) -> str:
+    t = follower.target
+    if t is None:
+        return "  [dim]No connection followed. In the connections view (2) select one and press f.[/]"
+    client, cport, server, sport, proto = t
+
+    def ep(ip, port):
+        n = names(ip)
+        return f"{escape(n)} ({ip}:{port})" if n else f"{ip}:{port}"
+
+    lines = [
+        f"  [b]{proto_name(proto)}[/]  [cyan]{ep(client, cport)}[/] ⇄ [dark_orange]{ep(server, sport)}[/]"
+        + ("   [yellow]joined mid-connection: earlier data not seen[/]" if follower.mid_stream else ""),
+    ]
+    extent = max(d.next + sum(len(x) for x, _ in d.held.values()) for d in follower.dirs.values())
+    bar_w = max(width - 34, 10)
+    for up, label, color in ((True, "client → server", "cyan"), (False, "server → client", "dark_orange")):
+        d = follower.dirs[up]
+        stats = f"{fmt_bytes(d.received)}"
+        if d.gaps:
+            stats += f" [red]gap {fmt_bytes(d.gaps)}[/]"
+        if d.retrans:
+            stats += f" [yellow]retr {fmt_bytes(d.retrans)}[/]"
+        if d.out_of_order:
+            stats += f" [dim]{d.out_of_order} ooo[/]"
+        if d.truncated:
+            stats += " [red]limit[/]"
+        lines.append(f"  [{color}]{label}[/] {_overview_bar(d, bar_w, extent)} {stats}")
+    lines.append(
+        f"  [dim]█ received  [red]░[/] missing  [yellow]▒[/] waiting (out of order) · "
+        f"{'hex' if hex_mode else 'text'} (h) · Esc back · payload of this connection only, "
+        f"max {fmt_bytes(1 << 20)} per direction, cleared when you leave[/]"
+    )
+    return "\n".join(lines)
+
+
+def _looks_encrypted(data: bytes) -> bool:
+    if len(data) >= 5 and data[0] in (0x14, 0x15, 0x16, 0x17) and data[1] == 0x03:
+        return True
+    printable = sum(32 <= b < 127 or b in (9, 10, 13) for b in data[:256])
+    return printable < len(data[:256]) * 0.7
+
+
+def chunk_text(c, hex_mode: bool, header: bool, start: float) -> Text:
+    """One stream chunk; ``header`` adds the direction/time line (omitted for continuations)."""
+    color = "cyan" if c.up else "dark_orange"
+    t = Text()
+    if c.kind == "gap":
+        return Text(f"  [gap: {c.size} bytes missing at offset {c.offset}]", style="bold red")
+    if c.kind == "retransmission":
+        return Text(f"  [retransmission of {c.size} bytes at offset {c.offset}]", style="dim yellow")
+    if c.kind == "event":
+        return Text(f"{'→' if c.up else '←'} [{c.data.decode(errors='replace')}]", style=f"bold {color}")
+    if header:
+        arrow = "→ client → server" if c.up else "← server → client"
+        t.append(f"{arrow}  +{c.time - start:.3f}s  @{c.offset}\n", style=f"bold {color}")
+    data = c.data
+    if hex_mode:
+        shown = data[:STREAM_HEX_LIMIT]
+        for off in range(0, len(shown), 16):
+            chunk = shown[off : off + 16]
+            hexpart = " ".join(f"{b:02x}" for b in chunk)
+            asc = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+            t.append(f"  {c.offset + off:08x}  {hexpart:<47}  {asc}\n", style=color)
+        more = len(data) - len(shown)
+    elif _looks_encrypted(data):
+        t.append(f"  [{len(data)} bytes, encrypted/binary — h shows hex]\n", style="dim")
+        more = 0
+    else:
+        shown = data[:STREAM_TEXT_LIMIT].decode("utf-8", errors="replace")
+        shown = "".join(ch if ch.isprintable() or ch in "\n\t" else "·" for ch in shown.replace("\r\n", "\n"))
+        t.append(shown if shown.endswith("\n") else shown + "\n", style=color)
+        more = len(data) - STREAM_TEXT_LIMIT
+    if more > 0:
+        t.append(f"  … {more} more bytes in this segment\n", style="dim")
+    t.rstrip()
+    return t

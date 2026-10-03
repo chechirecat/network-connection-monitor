@@ -75,11 +75,11 @@ def flags_text(flags: int) -> str:
     return out + ("." if flags & TCP_ACK else "")
 
 
-# Callback deciding whether a TCP segment continues a TLS ClientHello being collected
-# (src, sport, dst, dport) -> bool; see hostnames.HostNames.wants_payload.
+# Callback deciding whether a packet's whole payload is needed: a TLS ClientHello being
+# collected or the connection followed in the stream view. (src, sport, dst, dport) -> bool.
 Sniff = Callable[[str, int, str, int], bool]
 
-SNIFF_TLS_BYTES = 16384  # full ClientHello segments
+SNIFF_TCP_BYTES = 65535  # whole segments: ClientHellos and the followed stream
 SNIFF_DNS_BYTES = 4096  # DNS responses
 
 
@@ -154,13 +154,11 @@ def _parse_l4(
     # payload length from the IP lengths, so it is right even for truncated captures
     payload_len = max(length - payload_off, 0) if payload_off is not None else 0
     if sniff is not None and payload_len:
-        if proto == TCP:
-            head = data[payload_off : payload_off + 6]
-            # TLS handshake record carrying a ClientHello, or the rest of one being collected
-            if (len(head) == 6 and head[0] == 0x16 and head[1] == 0x03 and head[5] == 0x01) or sniff(
-                src, sport, dst, dport
-            ):
-                keep = max(keep, SNIFF_TLS_BYTES)
+        head = data[payload_off : payload_off + 6]
+        if sniff(src, sport, dst, dport):  # followed stream, or rest of a pending ClientHello
+            keep = max(keep, SNIFF_TCP_BYTES)
+        elif proto == TCP and len(head) == 6 and head[0] == 0x16 and head[1] == 0x03 and head[5] == 0x01:
+            keep = max(keep, SNIFF_TCP_BYTES)  # TLS handshake record carrying a ClientHello
         elif proto == UDP and sport == 53:
             keep = max(keep, SNIFF_DNS_BYTES)
     payload = bytes(data[payload_off : payload_off + min(keep, payload_len)]) if keep and payload_off is not None else b""

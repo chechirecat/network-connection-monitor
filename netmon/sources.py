@@ -208,6 +208,9 @@ class DemoSource(Source):
 
     def run(self, sink: Sink) -> None:
         rng = random.Random(1)
+        self._seq: dict[tuple, int] = {}  # next TCP sequence number per direction
+        self._counter: dict[tuple, int] = {}  # HTTP request number per direction
+        self._held: dict[tuple, Packet] = {}  # segment delayed to simulate reordering
         flows = []  # [client, cport, server, sport, proto, base_rate, level, ttl]
         for server, port, proto, rate in self.INTERNET_SERVERS + self.LAN_SERVERS:
             for client in rng.sample(self.LAN, rng.randint(1, 4)):
@@ -241,42 +244,92 @@ class DemoSource(Source):
                 total = f[5] * f[6] * dt
                 down = total * rng.uniform(0.6, 0.95)
                 client, cport, server, sport, proto = f[:5]
-                sink(self._packet(rng, client, server, proto, cport, sport, int(total - down) + 40, True))
-                sink(self._packet(rng, server, client, proto, sport, cport, int(down) + 40, False))
+                self._send(rng, sink, self._packet(rng, client, server, proto, cport, sport, int(total - down) + 40, True))
+                self._send(rng, sink, self._packet(rng, server, client, proto, sport, cport, int(down) + 40, False))
 
-    def _packet(self, rng, src, dst, proto, sport, dport, length, up) -> Packet:
-        """A synthetic packet; payload looks like the protocol (plain HTTP/DNS, TLS records otherwise)."""
+    def _packet(self, rng, src, dst, proto, sport, dport, length, up) -> Packet | None:
+        """A synthetic packet with consistent TCP sequence numbers. Payload bytes are only made up
+        when asked for: a short preview (payload capture) or full content for a followed stream."""
+        key = (src, sport, dst, dport)
+        followed = self.sniff is not None and self.sniff(src, sport, dst, dport)
         payload_len = max(length - 40, 0)
         payload = b""
-        if self.payload_bytes:
-            port = dport if up else sport
-            if port == 80:
-                payload = (b"GET /ubuntu/dists/noble/InRelease HTTP/1.1\r\nHost: archive.ubuntu.com\r\n"
-                           if up else b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n")
-            elif port == 53:
-                payload = bytes([rng.randrange(256), rng.randrange(256)]) + b"\x01\x00\x00\x01" + b"\x07example\x03com\x00"
-            else:
-                payload = b"\x17\x03\x03" + rng.randbytes(61)  # looks like TLS application data
-            payload = payload[: min(self.payload_bytes, payload_len)]
+        if followed:
+            payload_len = min(payload_len, 4096)  # readable chunks for the stream view
+            payload = self._content(rng, key, dport if up else sport, up, payload_len)
+            payload_len = len(payload)
+        elif self.payload_bytes:
+            payload = self._content(rng, key, dport if up else sport, up, self.payload_bytes)[: payload_len]
+        seq = None
+        if proto == TCP:
+            seq = self._seq.get(key, 1)
+            self._seq[key] = (seq + payload_len) & 0xFFFFFFFF
         flags = TCP_ACK | TCP_PSH if proto == TCP else 0
-        return Packet(src, dst, proto, sport, dport, length, ack=proto == TCP, tcp_flags=flags,
-                      seq=rng.getrandbits(32) if proto == TCP else None, payload_len=payload_len, payload=payload)
+        return Packet(src, dst, proto, sport, dport, payload_len + 40, ack=proto == TCP, tcp_flags=flags,
+                      seq=seq, payload_len=payload_len, payload=payload)
 
-    @staticmethod
-    def _close(sink: Sink, f) -> None:
+    def _content(self, rng, key, port, up, size) -> bytes:
+        """Protocol-looking payload: plain HTTP on port 80, DNS on 53, TLS records otherwise."""
+        if port == 80:
+            n = self._counter.get(key, 0)
+            self._counter[key] = n + 1
+            if up:
+                text = (f"GET /ubuntu/pool/main/p/pkg{n}/pkg{n}_1.{n}_amd64.deb HTTP/1.1\r\n"
+                        "Host: archive.ubuntu.com\r\nUser-Agent: Debian APT-HTTP/1.3 (2.7.14)\r\n\r\n")
+            else:
+                body = "".join(f"Package: pkg{n}-{i}\nVersion: 1.{n}.{i}\nArchitecture: amd64\n"
+                               f"Description: example package {i}\n\n" for i in range(60))
+                text = (f"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {len(body)}\r\n"
+                        f"\r\n{body}")
+            return text.encode()[:size]
+        if port == 53:
+            return (bytes([rng.randrange(256), rng.randrange(256)]) + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+                    + b"\x07example\x03com\x00\x00\x01\x00\x01")[:size]
+        body = rng.randbytes(max(size - 5, 0))
+        return (b"\x17\x03\x03" + len(body).to_bytes(2, "big") + body)[:size]
+
+    def _send(self, rng, sink: Sink, pkt: Packet | None) -> None:
+        """Deliver, occasionally impaired when the flow is followed (to show reordering, gaps
+        and retransmissions in the stream view)."""
+        if pkt is None:
+            return
+        key = (pkt.src, pkt.sport, pkt.dst, pkt.dport)
+        held = self._held.pop(key, None)
+        if self.sniff is not None and pkt.payload_len and self.sniff(*key):
+            r = rng.random()
+            if r < 0.04 and held is None:
+                self._held[key] = pkt  # deliver after the next one: out of order
+                return
+            if r < 0.05:
+                pkt = None  # lost
+            elif r < 0.08:
+                sink(pkt)  # duplicate: retransmission
+        if pkt is not None:
+            sink(pkt)
+        if held is not None:
+            sink(held)
+
+    def _close(self, sink: Sink, f) -> None:
         client, cport, server, sport, proto = f[:5]
         if proto == TCP:
             for src, dst, sp, dp in ((client, server, cport, sport), (server, client, sport, cport)):
-                sink(Packet(src, dst, proto, sp, dp, 52, ack=True, tcp_flags=TCP_FIN | TCP_ACK))
+                seq = self._seq.get((src, sp, dst, dp))
+                sink(Packet(src, dst, proto, sp, dp, 52, ack=True, tcp_flags=TCP_FIN | TCP_ACK, seq=seq))
 
     def _open(self, sink: Sink, f) -> None:
         client, cport, server, sport, proto = f[:5]
         if proto == TCP:
-            sink(Packet(client, server, proto, cport, sport, 60, syn=True, tcp_flags=TCP_SYN))
-            sink(Packet(server, client, proto, sport, cport, 60, syn=True, ack=True, tcp_flags=TCP_SYN | TCP_ACK))
+            isn_c, isn_s = random.getrandbits(32), random.getrandbits(32)
+            self._seq[(client, cport, server, sport)] = (isn_c + 1) & 0xFFFFFFFF
+            self._seq[(server, sport, client, cport)] = (isn_s + 1) & 0xFFFFFFFF
+            sink(Packet(client, server, proto, cport, sport, 60, syn=True, tcp_flags=TCP_SYN, seq=isn_c))
+            sink(Packet(server, client, proto, sport, cport, 60, syn=True, ack=True, tcp_flags=TCP_SYN | TCP_ACK,
+                        seq=isn_s))
             if server in self.SNI and sport in (443, 853, 993):
                 hello = build_client_hello(self.SNI[server])
+                seq = self._seq[(client, cport, server, sport)]
+                self._seq[(client, cport, server, sport)] = (seq + len(hello)) & 0xFFFFFFFF
                 sink(Packet(client, server, proto, cport, sport, 52 + len(hello), ack=True,
-                            tcp_flags=TCP_PSH | TCP_ACK, seq=1, payload_len=len(hello), payload=hello))
+                            tcp_flags=TCP_PSH | TCP_ACK, seq=seq, payload_len=len(hello), payload=hello))
         else:
             sink(Packet(client, server, proto, cport, sport, 60))

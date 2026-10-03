@@ -154,3 +154,29 @@ async def test_hostnames_label_boxes_and_payload_stays_opt_in():
         app.model.set_watch(lambda p: True)
         await asyncio.sleep(0.5)
         assert all(not e.packet.payload for e in app.model.dump)
+
+
+async def test_follow_stream_from_connections_view():
+    app = await _app()
+    async with app.run_test(size=(160, 45)) as pilot:
+        await asyncio.sleep(0.8)
+        await pilot.press("slash", *"port 80", "enter", "2")
+        await pilot.pause()
+        table = app.query_one("#conns")
+        assert table.row_count >= 1
+        await pilot.press("f")
+        await asyncio.sleep(1.5)
+        await pilot.pause()
+        assert app.view == "stream" and app.follower.target[3] == 80
+        text = "\n".join(line.text for line in app.query_one("#stream").lines)
+        assert "GET /ubuntu/pool" in text and "HTTP/1.1 200 OK" in text
+        assert "client → server" in str(app.query_one("#stream-head").render())
+
+        await pilot.press("h")
+        await asyncio.sleep(0.4)
+        await pilot.pause()
+        assert any("00000000" in line.text or "  0" in line.text for line in app.query_one("#stream").lines)
+
+        await pilot.press("escape")  # leaving the stream view stops following and drops the data
+        await pilot.pause()
+        assert app.view == "conns" and app.follower.target is None and not app.follower.chunks
