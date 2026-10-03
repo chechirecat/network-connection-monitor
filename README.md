@@ -1,6 +1,6 @@
 # netmon
 
-Terminal network traffic monitor. Traffic is grouped into **boxes per server**, each holding **one inner box per client** talking to it. Box size = traffic (current rate or total bytes, square-root scaled by default so small boxes stay readable), color = distance of the remote end (default), rate heat, protocol or service. The screen is split by position: **intranet on the left, internet on the right**.
+Terminal network traffic monitor: see who talks to whom, zoom from the whole network down to one connection's packets and reassembled payload. Traffic is grouped into **boxes per server**, each holding **one inner box per client** talking to it. Box size = traffic (current rate or total bytes, square-root scaled by default so small boxes stay readable), color = distance of the remote end (default), rate heat, protocol or service. The screen is split by position: **intranet on the left, internet on the right**.
 
 A client↔server pair is *intranet* when both ends are local (RFC1918, loopback, link-local, CGNAT `100.64/10`, ULA, multicast, plus any `--local-net`); otherwise *internet*. A LAN server reached from the internet therefore appears in the internet pane with its external clients.
 
@@ -31,6 +31,8 @@ The remote end of each connection is looked up offline by country:
 | gray | local / unknown |
 
 Brightness of a client box shows its traffic. The country lists are in `netmon/geo.py`.
+
+The country is where an address is *registered*, which can differ from where the server is. CDN and cloud addresses (Cloudflare, Google, AWS, …) are served from many locations at once, so e.g. a Cloudflare address shown as `CA` (Canada) is most likely answered from a data center near you. Check the learned hostname to see which service it is.
 
 The database is [IP to Country Lite by DB-IP](https://db-ip.com), licensed CC BY 4.0, published monthly. netmon keeps it in `~/.cache/netmon/` (under `sudo`, the invoking user's cache) and **downloads it in the background on start when it is missing or older than 31 days**; the UI keeps running with the old data meanwhile. A file older than a month triggers a warning on startup and stays flagged in the status bar until it is refreshed.
 
